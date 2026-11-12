@@ -203,9 +203,14 @@ async function handleContent(request, env) {
 }
 
 async function handleTrack(request, env) {
-  let body = {};
-  try { body = await request.json(); } catch { /* ignore */ }
-  const path = clean(body.path, 120) || '/';
+  let path = '';
+  try { path = clean(new URL(request.url).searchParams.get('path'), 120); } catch { /* ignore */ }
+  if (!path) {
+    let body = {};
+    try { body = await request.json(); } catch { /* ignore */ }
+    path = clean(body.path, 120);
+  }
+  if (!path) path = '/';
   const day = new Date().toISOString().slice(0, 10);
   await env.DB.prepare(
     `INSERT INTO visits(day,path,count) VALUES (?,?,1)
