@@ -287,6 +287,28 @@ async function logError(env, message, path) {
   } catch { /* ignore */ }
 }
 
+/* Cloudflare Turnstile verification.
+   Returns 'valid' | 'invalid' | 'missing' | 'disabled'.
+   - a token that fails verification is REJECTED (a bot proving it is a bot)
+   - a MISSING token is accepted but flagged for review, so an ad-blocker or a
+     blocked script never costs a real applicant */
+async function verifyTurnstile(env, request, token) {
+  const secret = env.TURNSTILE_SECRET_KEY;
+  if (!secret) return 'disabled';
+  if (!token) return 'missing';
+  try {
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret, response: token, remoteip: clientIp(request) }),
+    });
+    const j = await res.json().catch(() => ({}));
+    return j.success ? 'valid' : 'invalid';
+  } catch {
+    return 'missing';
+  }
+}
+
 /* send an operational alert straight to Bobby on Telegram */
 async function alertOwner(env, message) {
   const token = env.TELEGRAM_BOT_TOKEN;
@@ -426,6 +448,23 @@ async function handleApply(request, env, ctx) {
   // honeypot — real users never fill this
   if (clean(body.company, 100)) return json({ ok: true });
 
+  /* bot protection: an invalid token is rejected outright, a missing token is
+     accepted but flagged for review so a blocked script never loses a lead */
+  const tsState = await verifyTurnstile(env, request, clean(body.cf_turnstile_response, 2048));
+  if (tsState === 'invalid') {
+    return json({ ok: false, error: 'Your submission failed the security check. Please refresh and try again.' }, 403);
+  }
+  const flagged = tsState === 'missing' ? 1 : 0;
+
+  /* daily cap so a bot cannot flood the dashboard or the alert channel */
+  const todayCount = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM applications WHERE created_at > datetime('now','-1 day')"
+  ).first();
+  if (todayCount && todayCount.c >= 100) {
+    await alertOwner(env, 'Application cap reached (100 in 24h) - further submissions are being refused.');
+    return json({ ok: false, error: 'We are receiving too many applications right now. Please try again later.' }, 429);
+  }
+
   const name = clean(body.name, 120);
   const email = clean(body.email, 160).toLowerCase();
   const phone = clean(body.phone, 40);
@@ -455,7 +494,7 @@ async function handleApply(request, env, ctx) {
     `INSERT INTO applications
       (name,email,phone,capital,timeline,experience,interest,decision,source,page_url,referrer,user_agent,ip_hash,
        stage,score,owner,spam,duplicate_of,utm_source,utm_medium,utm_campaign,utm_content,utm_term,gclid,fbclid,device,country,visitor_id,delete_token)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, '', 0, ?, ?,?,?,?,?,?,?,?,?,?,?)`
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,'',?,?,?,?,?,?,?,?,?,?,?,?,?)`
   )
     .bind(
       name, email, phone, answers.capital, answers.timeline, answers.experience, answers.interest, answers.decision,
@@ -465,6 +504,7 @@ async function handleApply(request, env, ctx) {
       ua,
       key,
       score,
+      flagged,
       duplicateOf,
       clean(body.utm_source, 80),
       clean(body.utm_medium, 80),
@@ -483,9 +523,10 @@ async function handleApply(request, env, ctx) {
   const leadId = res && res.meta && res.meta.last_row_id ? res.meta.last_row_id : null;
   const lead = { id: leadId, name, email, phone, ...answers, score, duplicateOf };
 
-  await logActivity(env, 'visitor', 'applied', leadId, `score ${score} (${scoreBand(score)})`);
+  await logActivity(env, 'visitor', 'applied', leadId, `score ${score} (${scoreBand(score)})${flagged ? ' [no bot check]' : ''}`);
   await recordEvent(env, 'apply_complete', '/', visitorId, { score });
-  await notifyLead(env, ctx, lead);
+  /* only a lead that passed the bot check pings Bobby's phone */
+  if (!flagged) await notifyLead(env, ctx, lead);
   if (ctx && ctx.waitUntil) {
     ctx.waitUntil(deliverWebhooks(env, 'lead.created', lead));
   } else {
