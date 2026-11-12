@@ -359,6 +359,8 @@ async function handleApply(request, env, ctx) {
   const country = clean(request.headers.get('cf-ipcountry') || '', 8);
   const visitorId = clean(body.visitor_id, 64);
   const score = scoreLead(answers);
+  /* per-application secret so the visitor can delete THIS record and nothing else */
+  const deleteToken = b64url(crypto.getRandomValues(new Uint8Array(18)));
 
   // duplicate detection: same email again inside 30 days
   let duplicateOf = null;
@@ -371,8 +373,8 @@ async function handleApply(request, env, ctx) {
   const res = await env.DB.prepare(
     `INSERT INTO applications
       (name,email,phone,capital,timeline,experience,interest,decision,source,page_url,referrer,user_agent,ip_hash,
-       stage,score,owner,spam,duplicate_of,utm_source,utm_medium,utm_campaign,utm_content,utm_term,gclid,fbclid,device,country,visitor_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, '', 0, ?, ?,?,?,?,?,?,?,?,?,?)`
+       stage,score,owner,spam,duplicate_of,utm_source,utm_medium,utm_campaign,utm_content,utm_term,gclid,fbclid,device,country,visitor_id,delete_token)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, '', 0, ?, ?,?,?,?,?,?,?,?,?,?,?)`
   )
     .bind(
       name, email, phone, answers.capital, answers.timeline, answers.experience, answers.interest, answers.decision,
@@ -392,7 +394,8 @@ async function handleApply(request, env, ctx) {
       clean(body.fbclid, 80),
       device,
       country,
-      visitorId
+      visitorId,
+      deleteToken
     )
     .run();
 
@@ -408,7 +411,7 @@ async function handleApply(request, env, ctx) {
     await deliverWebhooks(env, 'lead.created', lead);
   }
 
-  return json({ ok: true, id: leadId });
+  return json({ ok: true, id: leadId, delete_token: deleteToken });
 }
 
 async function handleContent(request, env) {
@@ -636,7 +639,7 @@ async function handleSaveContent(request, env) {
 
 async function handleExport(request, env) {
   const rows = await env.DB.prepare('SELECT * FROM applications ORDER BY id DESC').all();
-  const header = ['id', 'created_at', 'name', 'email', 'phone', 'capital', 'timeline', 'experience', 'interest', 'decision', 'status', 'notes'];
+  const header = ['id', 'created_at', 'name', 'email', 'phone', 'capital', 'timeline', 'experience', 'interest', 'decision', 'stage', 'score', 'owner', 'source', 'utm_source', 'utm_campaign', 'status', 'notes'];
   const lines = [header.join(',')];
   for (const r of rows.results || []) {
     lines.push(header.map((h) => csvCell(r[h])).join(','));
@@ -1095,17 +1098,29 @@ export default {
         return json({ ok: true, lead: row });
       }
 
-      /* ---- public GDPR self-delete ---- */
+      /* ---- public GDPR self-delete (requires the per-application token) ---- */
       if (path === '/api/delete-my-data' && request.method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const email = clean(body.email, 160).toLowerCase();
+        const token = clean(body.token, 64);
         if (!isEmail(email)) return json({ ok: false, error: 'Valid email required.' }, 400);
-        const rows = await env.DB.prepare('SELECT id FROM applications WHERE email = ?').bind(email).all();
+        if (!token) return json({ ok: false, error: 'Your delete code is required.' }, 400);
+        /* throttle so the endpoint cannot be used to probe for valid codes */
+        const ipKey = await hashIp(clientIp(request), env.SESSION_SECRET);
+        const recent = await env.DB.prepare(
+          `SELECT COUNT(*) AS c FROM applications WHERE ip_hash = ? AND created_at > datetime('now','-10 minutes')`
+        ).bind(ipKey).first();
+        if (recent && recent.c >= 20) return json({ ok: false, error: 'Too many attempts. Please try again later.' }, 429);
+        /* only rows whose email AND token both match can be deleted */
+        const rows = await env.DB.prepare('SELECT id FROM applications WHERE email = ? AND delete_token = ?').bind(email, token).all();
         for (const r of rows.results || []) {
           await env.DB.prepare('DELETE FROM applications WHERE id = ?').bind(r.id).run();
-          await logActivity(env, 'visitor', 'gdpr_delete', r.id, 'self-service delete');
+          await logActivity(env, 'visitor', 'gdpr_delete', r.id, 'self-service delete (token verified)');
         }
-        return json({ ok: true, removed: (rows.results || []).length });
+        if (!rows.results || !rows.results.length) {
+          return json({ ok: false, error: 'That email and delete code do not match an application.' }, 404);
+        }
+        return json({ ok: true, removed: rows.results.length });
       }
 
       /* ---- public funnel counters for the site ---- */

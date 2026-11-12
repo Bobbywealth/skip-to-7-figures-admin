@@ -47,6 +47,7 @@ export function dashboardPage(data, csrf) {
   const starts = Number(f.starts || 0);
   const completes = Number(f.completes || 0);
   const conv = views > 0 ? ((completes / views) * 100).toFixed(1) : '0.0';
+  const funnelMax = Math.max(views, starts, completes, 1);
 
   const stat = (n, label, tone) =>
     `<div class="card stat${tone ? ' ' + tone : ''}"><b>${esc(n ?? 0)}</b><span>${esc(label)}</span></div>`;
@@ -176,9 +177,9 @@ export function dashboardPage(data, csrf) {
         <div class="card panel">
           <h2>Funnel</h2>
           <p class="hint">Views → started the form → completed.</p>
-          ${bar('Views', views, '#C99B54')}
-          ${bar('Started form', starts, '#8A6420')}
-          ${bar('Completed', completes, '#1F5C3A')}
+          ${bar('Views', views, '#C99B54', funnelMax)}
+          ${bar('Started form', starts, '#8A6420', funnelMax)}
+          ${bar('Completed', completes, '#1F5C3A', funnelMax)}
         </div>
         <div class="card panel">
           <h2>Pipeline</h2>
@@ -424,7 +425,7 @@ export function dashboardPage(data, csrf) {
     </script>`;
 }
 
-function bar(label, value, color) {
-  const pct = Math.min(100, Math.round((Number(value || 0) / Math.max(1, Number(value || 0), 1)) * 100));
+function bar(label, value, color, max) {
+  const pct = Math.min(100, Math.round((Number(value || 0) / Math.max(1, Number(max || 0))) * 100));
   return `<div class="fbar"><span class="fbar__l">${esc(label)}</span><span class="fbar__track"><i style="width:${Math.max(2, pct)}%;background:${color}"></i></span><span class="fbar__n">${esc(value || 0)}</span></div>`;
 }
