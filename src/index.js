@@ -198,7 +198,8 @@ async function handleApply(request, env, ctx) {
 async function handleContent(request, env) {
   const rows = await env.DB.prepare('SELECT key, value FROM content').all();
   const out = {};
-  for (const r of rows.rows || []) if (r.value) out[r.key] = r.value;
+  /* D1 returns rows under .results — NOT .rows (that is the node-postgres shape) */
+  for (const r of rows.results || []) if (r.value) out[r.key] = r.value;
   return json(out);
 }
 
