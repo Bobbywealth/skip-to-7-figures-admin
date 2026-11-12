@@ -58,3 +58,10 @@ INSERT OR IGNORE INTO content(key,value) VALUES ('headline','');
 INSERT OR IGNORE INTO content(key,value) VALUES ('subheadline','');
 INSERT OR IGNORE INTO content(key,value) VALUES ('cta_label','');
 INSERT OR IGNORE INTO content(key,value) VALUES ('specialties','');
+
+-- Rate guard for outbound lead notifications (max 8 Telegram alerts per hour)
+CREATE TABLE IF NOT EXISTS notify_guard (
+  key          TEXT PRIMARY KEY,
+  count        INTEGER NOT NULL DEFAULT 0,
+  window_start INTEGER NOT NULL
+);

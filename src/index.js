@@ -146,6 +146,63 @@ function isEmail(v) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v);
 }
 
+/* ---------------- lead notifications (Telegram) ---------------- */
+
+async function notifyLead(env, ctx, lead) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const chatId = env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  try {
+    // global rate guard: max 8 alerts per hour so the channel cannot be flooded
+    const now = Date.now();
+    const row = await env.DB.prepare('SELECT count, window_start FROM notify_guard WHERE key = ?').bind('telegram').first();
+    let allowed = true;
+    if (row && now - row.window_start < 3600000 && row.count >= 8) allowed = false;
+    if (allowed) {
+      if (row && now - row.window_start < 3600000) {
+        await env.DB.prepare('UPDATE notify_guard SET count = count + 1 WHERE key = ?').bind('telegram').run();
+      } else {
+        await env.DB.prepare(
+          `INSERT INTO notify_guard(key,count,window_start) VALUES (?,1,?)
+           ON CONFLICT(key) DO UPDATE SET count = 1, window_start = excluded.window_start`
+        ).bind('telegram', now).run();
+      }
+      const lines = [
+        'New Skip to 7 Figures application',
+        '',
+        lead.name ? `Name: ${lead.name}` : null,
+        lead.email ? `Email: ${lead.email}` : null,
+        lead.phone ? `Phone: ${lead.phone}` : null,
+        lead.capital ? `Capital: ${lead.capital}` : null,
+        lead.timeline ? `Timeline: ${lead.timeline}` : null,
+        lead.experience ? `Experience: ${lead.experience}` : null,
+        lead.interest ? `Interest: ${lead.interest}` : null,
+        lead.decision ? `Decision: ${lead.decision}` : null,
+        '',
+        'Dashboard: https://skip-to-7-figures-admin.skip7figures.workers.dev/admin/dashboard',
+      ].filter((l) => l !== null);
+      const task = fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: lines.join('\n'), disable_notification: false }),
+      })
+        .then(async (r) => {
+          const body = await r.text();
+          console.log(`[lead-notify] telegram status=${r.status} ok=${/\"ok\":true/.test(body)} chat=${chatId}`);
+          return body;
+        })
+        .catch((e) => {
+          console.log(`[lead-notify] telegram FAILED: ${e && e.message ? e.message : e}`);
+          return '';
+        });
+      if (ctx && ctx.waitUntil) ctx.waitUntil(task);
+      else await task;
+    }
+  } catch {
+    /* a notification failure must never lose the lead */
+  }
+}
+
 /* ---------------- public API ---------------- */
 
 async function handleApply(request, env, ctx) {
@@ -191,6 +248,8 @@ async function handleApply(request, env, ctx) {
       key
     )
     .run();
+
+  await notifyLead(env, ctx, { name, email, phone, ...answers });
 
   return json({ ok: true });
 }
@@ -444,6 +503,11 @@ tr.row:hover{background:#FBF8F2}
   .kv{grid-template-columns:1fr;gap:3px}
   .kv dd{margin-bottom:8px}
   th.hide,td.hide{display:none}
+  td,th{padding-left:8px;padding-right:8px}
+  .who a{word-break:break-all}
+  .btn.sm{padding:8px 12px}
+  .stat{padding:16px 18px}
+  .stat b{font-size:1.8rem}
 }
 </style></head><body>${body}</body></html>`;
 }
