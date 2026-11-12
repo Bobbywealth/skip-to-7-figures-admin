@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: Check the admin worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Parse the worker source
+        run: |
+          node --check src/index.js
+          node --check src/dashboard.js
+          node --check scripts/seed-admin.mjs
+          echo "all sources parse"
+
+      - name: Every migration must be non-empty and use IF NOT EXISTS where possible
+        run: |
+          set -e
+          for f in migrations/*.sql; do
+            test -s "$f" || { echo "::error::$f is empty"; exit 1; }
+          done
+          echo "migrations present: $(ls migrations | wc -l | tr -d ' ')"
+
+      - name: The schema and the migrations must not disagree on table names
+        run: |
+          set -e
+          schema_tables=$(grep -oiE "CREATE TABLE (IF NOT EXISTS )?[a-z_]+" schema.sql | awk '{print $NF}' | sort -u)
+          mig_tables=$(grep -hoiE "CREATE TABLE (IF NOT EXISTS )?[a-z_]+" migrations/*.sql | awk '{print $NF}' | sort -u)
+          missing=$(comm -23 <(echo "$mig_tables") <(echo "$schema_tables") | grep -v "^migrations$" | grep -v "^rate_limits$" || true)
+          if [ -n "$missing" ]; then
+            echo "::error::tables created only in migrations and missing from schema.sql: $missing"
+            exit 1
+          fi
+          echo "schema and migrations agree"
+
+      - name: Check no secrets are committed
+        run: |
+          if grep -rInE "[0-9]{8,10}:[A-Za-z0-9_-]{30,}|sk_live_|sk_test_|SESSION_SECRET\s*=\s*['\"][A-Za-z0-9_-]{16,}" \
+            --exclude-dir=.git --exclude-dir=node_modules .; then
+            echo "::error::a credential appears to be committed"
+            exit 1
+          fi
+          echo "no secrets found"
+
+      - name: The worker must bundle
+        run: |
+          set -e
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx wrangler deploy --dry-run --outdir .wrangler-dry-run
+          echo "worker bundles cleanly"

@@ -20,10 +20,29 @@ import { dashboardPage } from './dashboard.js';
  */
 
 const ORIGINS = new Set([
+  'https://skip-to-7-figures.skip7figures.workers.dev',
   'https://skip-to-7-figures.onrender.com',
   'https://skipto7figures.com',
   'https://www.skipto7figures.com',
 ]);
+/* extra origins can be added at runtime from the dashboard (settings key
+   "allowed_origins", comma separated) so a new domain does not need a redeploy */
+let ORIGIN_CACHE = { at: 0, set: ORIGINS };
+async function allowedOrigins(env) {
+  if (Date.now() - ORIGIN_CACHE.at < 60000) return ORIGIN_CACHE.set;
+  const set = new Set(ORIGINS);
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'allowed_origins'").first();
+    if (row && row.value) {
+      for (const o of String(row.value).split(',')) {
+        const t = o.trim();
+        if (/^https:\/\//i.test(t)) set.add(t);
+      }
+    }
+  } catch { /* fall back to the built-in list */ }
+  ORIGIN_CACHE = { at: Date.now(), set };
+  return set;
+}
 const SESSION_COOKIE = 'sf7_session';
 const SESSION_DAYS = 7;
 const MAX_ATTEMPTS = 8;
@@ -124,9 +143,10 @@ function clearCookie() {
 
 /* ---------------- helpers ---------------- */
 
-function corsHeaders(request) {
+function corsHeaders(request, origins) {
   const origin = request.headers.get('origin');
-  const allow = origin && ORIGINS.has(origin) ? origin : null;
+  const set = origins instanceof Set ? origins : ORIGINS;
+  const allow = origin && set.has(origin) ? origin : null;
   const h = {};
   if (allow) h['Access-Control-Allow-Origin'] = allow;
   h['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
@@ -135,16 +155,43 @@ function corsHeaders(request) {
   h['Vary'] = 'Origin';
   return h;
 }
+
+/* ---------------- security headers ---------------- */
+const ADMIN_CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "img-src 'self' data:",
+  "font-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "script-src 'self' 'unsafe-inline'",
+  "connect-src 'self'",
+].join('; ');
+function securityHeaders(isHtml) {
+  const h = {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), interest-cohort=(), browsing-topics=()',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'X-Permitted-Cross-Domain-Policies': 'none',
+  };
+  if (isHtml) h['Content-Security-Policy'] = ADMIN_CSP;
+  return h;
+}
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders(false), ...extra },
   });
 }
 function html(body, status = 200, extra = {}) {
   return new Response(body, {
     status,
-    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders(true), ...extra },
   });
 }
 function clientIp(request) {
@@ -238,6 +285,40 @@ async function logError(env, message, path) {
   try {
     await env.DB.prepare('INSERT INTO errors(message,path) VALUES (?,?)').bind(String(message || '').slice(0, 500), String(path || '').slice(0, 200)).run();
   } catch { /* ignore */ }
+}
+
+/* send an operational alert straight to Bobby on Telegram */
+async function alertOwner(env, message) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const chatId = env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: `Skip to 7 Figures - admin\n${String(message).slice(0, 900)}` }),
+    });
+  } catch { /* never let an alert failure break the request */ }
+}
+
+/* fixed-window rate limiter backed by D1 */
+async function hitRateLimit(env, key, max, windowMs) {
+  try {
+    const now = Date.now();
+    const row = await env.DB.prepare('SELECT count, window_start FROM rate_limits WHERE key = ?').bind(key).first();
+    if (row && now - row.window_start < windowMs) {
+      if (row.count >= max) return false;
+      await env.DB.prepare('UPDATE rate_limits SET count = count + 1 WHERE key = ?').bind(key).run();
+    } else {
+      await env.DB.prepare(
+        `INSERT INTO rate_limits(key,count,window_start) VALUES (?,1,?)
+         ON CONFLICT(key) DO UPDATE SET count = 1, window_start = excluded.window_start`
+      ).bind(key, now).run();
+    }
+    return true;
+  } catch {
+    return true; /* fail open on the limiter, never fail closed on the API */
+  }
 }
 
 async function recordEvent(env, name, path, visitorId, data) {
@@ -826,82 +907,78 @@ function loginPage({ error, ok } = {}) {
   );
 }
 
-export default {
-  async scheduled(event, env, ctx) {
-    // daily digest + retention purge
-    try {
-      const digest = await buildDigest(env);
-      if (digest.newLeads > 0 || digest.total > 0) {
-        const token = env.TELEGRAM_BOT_TOKEN;
-        const chatId = env.TELEGRAM_CHAT_ID;
-        if (token && chatId) {
-          await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text: digest.text }),
-          });
-        }
-        await env.DB.prepare('INSERT INTO notify_log(kind,detail) VALUES (?,?)').bind('digest', digest.text.slice(0, 500)).run();
-      }
-      const days = parseInt((await getSettings(env)).retention_days || '0', 10) || 0;
-      if (days > 0) {
-        const r = await env.DB.prepare(`DELETE FROM applications WHERE created_at < datetime('now', ?)`).bind('-' + days + ' days').run();
-        if (r && r.meta && r.meta.changes) await logActivity(env, 'system', 'retention_purge', null, `${r.meta.changes} leads older than ${days} days`);
-      }
-    } catch (e) {
-      try { await logError(env, 'scheduled: ' + (e && e.message ? e.message : e), 'scheduled'); } catch { /* ignore */ }
-    }
-  },
-  async fetch(request, env, ctx) {
+async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, '') || '/';
-    const isPublicApi = path.startsWith('/api/');
-    const cors = isPublicApi ? corsHeaders(request) : {};
+    const isPublicApi = path.startsWith('/api/') || path.startsWith('/v1/');
+    const origins = await allowedOrigins(env);
+    const cors = isPublicApi ? corsHeaders(request, origins) : {};
 
     if (request.method === 'OPTIONS' && isPublicApi) return new Response(null, { status: 204, headers: cors });
+    const method = request.method === 'HEAD' ? 'GET' : request.method;
 
     try {
-      if (path === '/' && request.method === 'GET') {
+      if (path === '/' && method === 'GET') {
         return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'no-store' } });
       }
       if (path === '/api/health') return json({ ok: true, service: 'skip7figures-admin' }, 200, cors);
-      if (path === '/api/apply' && request.method === 'POST') {
+      if (path === '/api/apply' && method === 'POST') {
         const res = await handleApply(request, env, ctx);
         for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
         return res;
       }
-      if (path === '/api/content' && request.method === 'GET') {
+      if (path === '/api/content' && method === 'GET') {
         const res = await handleContent(request, env);
         for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
         return res;
       }
-      if (path === '/api/track' && request.method === 'POST') {
+      if (path === '/api/track' && method === 'POST') {
+        /* the public beacon must not be able to inflate the stats */
+        const ipKey = await hashIp(clientIp(request), env.SESSION_SECRET);
+        const allowed = await hitRateLimit(env, 'track:' + ipKey, 120, 60000);
+        if (!allowed) return json({ ok: false, error: 'Too many events.' }, 429, cors);
         const res = await handleTrack(request, env);
         for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
         return res;
       }
 
+      /* ---- service status / health ---- */
+      if (path === '/api/status' && method === 'GET') {
+        const db = await env.DB.prepare('SELECT COUNT(*) AS c FROM applications').first();
+        const err = await env.DB.prepare('SELECT created_at, message FROM errors ORDER BY id DESC LIMIT 1').first();
+        const last = await env.DB.prepare('SELECT created_at FROM activity ORDER BY id DESC LIMIT 1').first();
+        return json({
+          ok: true,
+          service: 'skip7figures-admin',
+          time: new Date().toISOString(),
+          database: db ? 'ok' : 'unavailable',
+          leads: (db && db.c) || 0,
+          lastError: err ? { at: err.created_at, message: err.message } : null,
+          lastActivity: last ? last.created_at : null,
+        }, 200, cors);
+      }
+
       if (path === '/admin' || path === '/admin/login') {
-        if (request.method === 'GET') {
+        if (method === 'GET') {
           const session = await readSession(env.SESSION_SECRET, request, env);
           if (session) return new Response(null, { status: 302, headers: { Location: '/admin/dashboard', 'Cache-Control': 'no-store' } });
           return html(loginPage({}));
         }
-        if (request.method === 'POST') return await handleLogin(request, env);
+        if (method === 'POST') return await handleLogin(request, env);
       }
-      if (path === '/admin/logout' && request.method === 'POST') return await handleLogout(request, env);
+      if (path === '/admin/logout' && method === 'POST') return await handleLogout(request, env);
 
-      if (path === '/admin/dashboard' && request.method === 'GET') {
+      if (path === '/admin/dashboard' && method === 'GET') {
         const session = await readSession(env.SESSION_SECRET, request, env);
         if (!session) return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'no-store' } });
         return await handleDashboard(request, env, session);
       }
-      if (path === '/admin/export.csv' && request.method === 'GET') {
+      if (path === '/admin/export.csv' && method === 'GET') {
         const session = await readSession(env.SESSION_SECRET, request, env);
         if (!session) return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'no-store' } });
         return await handleExport(request, env);
       }
-      if (path.startsWith('/admin/application/') && request.method === 'POST') {
+      if (path.startsWith('/admin/application/') && method === 'POST') {
         const session = await readSession(env.SESSION_SECRET, request, env);
         if (!session) return json({ ok: false, error: 'Not signed in.' }, 401);
         const token = request.headers.get('x-csrf-token');
@@ -910,7 +987,7 @@ export default {
         if (!id) return json({ ok: false, error: 'Bad id.' }, 400);
         return await handleUpdateApplication(request, env, session, id);
       }
-      if (path === '/admin/content' && request.method === 'POST') {
+      if (path === '/admin/content' && method === 'POST') {
         const session = await readSession(env.SESSION_SECRET, request, env);
         if (!session) return json({ ok: false, error: 'Not signed in.' }, 401);
         const token = request.headers.get('x-csrf-token');
@@ -927,7 +1004,7 @@ export default {
         if (!token || !constantTimeEqual(String(token), String(session.csrf))) return json({ ok: false, error: 'Invalid CSRF token.' }, 403);
       }
 
-      if (path === '/admin/application/bulk' && request.method === 'POST') {
+      if (path === '/admin/application/bulk' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(Boolean).slice(0, 500) : [];
         const stage = STAGES.includes(body.stage) ? body.stage : null;
@@ -947,7 +1024,7 @@ export default {
         return json({ ok: true });
       }
 
-      if (path.startsWith('/admin/application/') && request.method === 'GET') {
+      if (path.startsWith('/admin/application/') && method === 'GET') {
         const id = parseInt(path.split('/').pop(), 10);
         const row = await env.DB.prepare('SELECT * FROM applications WHERE id = ?').bind(id).first();
         if (!row) return json({ ok: false, error: 'Not found.' }, 404);
@@ -955,13 +1032,13 @@ export default {
         return json({ ok: true, lead: row, activity: act.results || [] });
       }
 
-      if (path === '/admin/api-key' && request.method === 'POST') {
+      if (path === '/admin/api-key' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const created = await createApiKey(env, clean(body.name, 60) || 'integration');
         await logActivity(env, session.sub, 'api_key_created', null, created.name);
         return json({ ok: true, key: created.raw, prefix: created.prefix });
       }
-      if (path === '/admin/api-key' && request.method === 'GET') {
+      if (path === '/admin/api-key' && method === 'GET') {
         const rows = await env.DB.prepare('SELECT id,name,prefix,created_at,last_used_at FROM api_keys ORDER BY id DESC').all();
         return json({ ok: true, keys: rows.results || [] });
       }
@@ -972,11 +1049,11 @@ export default {
         return json({ ok: true });
       }
 
-      if (path === '/admin/sessions' && request.method === 'GET') {
+      if (path === '/admin/sessions' && method === 'GET') {
         const rows = await env.DB.prepare('SELECT id,email,created_at,last_seen,user_agent,revoked FROM admin_sessions ORDER BY created_at DESC LIMIT 50').all();
         return json({ ok: true, sessions: rows.results || [] });
       }
-      if (path === '/admin/sessions/revoke' && request.method === 'POST') {
+      if (path === '/admin/sessions/revoke' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const sid = clean(body.sid, 64);
         if (!sid) return json({ ok: false }, 400);
@@ -985,20 +1062,20 @@ export default {
         return json({ ok: true });
       }
 
-      if (path === '/admin/activity' && request.method === 'GET') {
+      if (path === '/admin/activity' && method === 'GET') {
         const rows = await env.DB.prepare('SELECT * FROM activity ORDER BY id DESC LIMIT 100').all();
         return json({ ok: true, activity: rows.results || [] });
       }
-      if (path === '/admin/errors' && request.method === 'GET') {
+      if (path === '/admin/errors' && method === 'GET') {
         const rows = await env.DB.prepare('SELECT * FROM errors ORDER BY id DESC LIMIT 50').all();
         return json({ ok: true, errors: rows.results || [] });
       }
 
-      if (path === '/admin/admins' && request.method === 'GET') {
+      if (path === '/admin/admins' && method === 'GET') {
         const rows = await env.DB.prepare('SELECT id,email,created_at,last_login_at FROM admins ORDER BY id').all();
         return json({ ok: true, admins: rows.results || [] });
       }
-      if (path === '/admin/admins' && request.method === 'POST') {
+      if (path === '/admin/admins' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const email = clean(body.email, 160).toLowerCase();
         const password = String(body.password || '');
@@ -1015,7 +1092,7 @@ export default {
         await logActivity(env, session.sub, 'admin_removed', id, '');
         return json({ ok: true });
       }
-      if (path === '/admin/password' && request.method === 'POST') {
+      if (path === '/admin/password' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const current = String(body.current || '');
         const next = String(body.next || '');
@@ -1031,10 +1108,10 @@ export default {
         return json({ ok: true });
       }
 
-      if (path === '/admin/settings' && request.method === 'GET') {
+      if (path === '/admin/settings' && method === 'GET') {
         return json({ ok: true, settings: await getSettings(env) });
       }
-      if (path === '/admin/settings' && request.method === 'POST') {
+      if (path === '/admin/settings' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         for (const [k, v] of Object.entries(body)) {
           if (typeof v === 'string' || typeof v === 'number') await setSetting(env, clean(k, 60), clean(String(v), 400));
@@ -1043,11 +1120,11 @@ export default {
         return json({ ok: true });
       }
 
-      if (path === '/admin/webhooks' && request.method === 'GET') {
+      if (path === '/admin/webhooks' && method === 'GET') {
         const rows = await env.DB.prepare('SELECT * FROM webhook_out ORDER BY id DESC LIMIT 50').all();
         return json({ ok: true, deliveries: rows.results || [] });
       }
-      if (path === '/admin/webhooks' && request.method === 'POST') {
+      if (path === '/admin/webhooks' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const url = clean(body.url, 300);
         if (!/^https?:\/\//i.test(url)) return json({ ok: false, error: 'A valid http(s) URL is required.' }, 400);
@@ -1060,7 +1137,7 @@ export default {
         await env.DB.prepare('DELETE FROM webhook_out WHERE id = ?').bind(id).run();
         return json({ ok: true });
       }
-      if (path === '/admin/webhooks/test' && request.method === 'POST') {
+      if (path === '/admin/webhooks/test' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const url = clean(body.url, 300);
         if (!/^https?:\/\//i.test(url)) return json({ ok: false, error: 'A valid http(s) URL is required.' }, 400);
@@ -1073,10 +1150,22 @@ export default {
         }
       }
 
-      if (path === '/admin/digest' && request.method === 'GET') {
+      if (path === '/admin/digest' && method === 'GET') {
         return json({ ok: true, digest: await buildDigest(env) });
       }
-      if (path === '/admin/recalc' && request.method === 'POST') {
+      if (path === '/admin/backup' && method === 'GET') {
+        const apps = await env.DB.prepare('SELECT * FROM applications ORDER BY id').all();
+        const act = await env.DB.prepare('SELECT * FROM activity ORDER BY id').all();
+        const set = await env.DB.prepare('SELECT * FROM settings').all();
+        return json({
+          ok: true,
+          exported_at: new Date().toISOString(),
+          applications: apps.results || [],
+          activity: act.results || [],
+          settings: set.results || [],
+        });
+      }
+      if (path === '/admin/recalc' && method === 'POST') {
         const rows = await env.DB.prepare('SELECT id,capital,timeline,experience,interest,decision FROM applications').all();
         for (const r of rows.results || []) {
           await env.DB.prepare('UPDATE applications SET score = ? WHERE id = ?').bind(scoreLead(r), r.id).run();
@@ -1086,7 +1175,7 @@ export default {
       }
 
       /* ---- API-key protected JSON API for external tools ---- */
-      if ((path === '/v1/leads' || path.startsWith('/v1/leads/')) && request.method === 'GET') {
+      if ((path === '/v1/leads' || path.startsWith('/v1/leads/')) && method === 'GET') {
         const key = await verifyApiKey(env, request);
         if (!key) return json({ ok: false, error: 'Invalid or missing API key.' }, 401);
         if (path === '/v1/leads') {
@@ -1101,7 +1190,7 @@ export default {
       }
 
       /* ---- public GDPR self-delete (requires the per-application token) ---- */
-      if (path === '/api/delete-my-data' && request.method === 'POST') {
+      if (path === '/api/delete-my-data' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const email = clean(body.email, 160).toLowerCase();
         const token = clean(body.token, 64);
@@ -1126,7 +1215,7 @@ export default {
       }
 
       /* ---- public funnel counters for the site ---- */
-      if (path === '/api/stats' && request.method === 'GET') {
+      if (path === '/api/stats' && method === 'GET') {
         const v = await env.DB.prepare('SELECT COALESCE(SUM(count),0) AS total FROM visits').first();
         const e = await env.DB.prepare("SELECT COUNT(*) AS c FROM events WHERE name = 'apply_start'").first();
         const c = await env.DB.prepare("SELECT COUNT(*) AS c FROM events WHERE name = 'apply_complete'").first();
@@ -1134,10 +1223,92 @@ export default {
         return json({ ok: true, views: (v && v.total) || 0, starts: (e && e.c) || 0, completes: (c && c.c) || 0, leads: (l && l.c) || 0 });
       }
 
+      if (isPublicApi) return json({ ok: false, error: 'Not found.' }, 404, cors);
       return html('<h1>Not found</h1><p><a href="/admin">Go to admin</a></p>', 404);
     } catch (err) {
-      try { await logError(env, (err && err.message ? err.message : 'unknown') + ' @ ' + path, path); } catch { /* ignore */ }
-      return new Response(`Error: ${err && err.message ? err.message : 'unknown'}`, { status: 500 });
+      const message = (err && err.message ? err.message : 'unknown');
+      try { await logError(env, message + ' @ ' + path, path); } catch { /* ignore */ }
+      try { await alertOwner(env, 'API error on ' + path + ': ' + message); } catch { /* ignore */ }
+      return json({ ok: false, error: 'Server error.' }, 500);
     }
+  }
+
+export default {
+  async scheduled(event, env, ctx) {
+    // uptime self-check on every fire, digest + retention once a day
+    try {
+      const checks = [
+        ['site', 'https://skip-to-7-figures.skip7figures.workers.dev/'],
+        ['site-fallback', 'https://skip-to-7-figures.onrender.com/'],
+        ['api', 'https://skip-to-7-figures-admin.skip7figures.workers.dev/api/health'],
+      ];
+      const down = [];
+      for (const [name, url] of checks) {
+        try {
+          const r = await fetch(url, { method: 'GET', headers: { 'User-Agent': 's7-uptime-check' } });
+          if (!r.ok) down.push(`${name} (HTTP ${r.status})`);
+        } catch (e) {
+          down.push(`${name} (${e && e.message ? e.message : 'unreachable'})`);
+        }
+      }
+      if (down.length) {
+        await alertOwner(env, 'UPTIME ALERT - down: ' + down.join(', '));
+      } else {
+        try { await env.DB.prepare('INSERT INTO notify_log(kind,detail) VALUES (?,?)').bind('uptime', 'ok').run(); } catch { /* ignore */ }
+      }
+
+      const today = new Date().toISOString().slice(0, 10);
+      const already = await env.DB.prepare('SELECT id FROM notify_log WHERE kind = ? AND date(created_at) = ? LIMIT 1').bind('digest', today).first();
+      if (!already) {
+        const digest = await buildDigest(env);
+        if (digest.total > 0) {
+          const token = env.TELEGRAM_BOT_TOKEN;
+          const chatId = env.TELEGRAM_CHAT_ID;
+          if (token && chatId) {
+            await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: chatId, text: digest.text }),
+            });
+          }
+          await env.DB.prepare('INSERT INTO notify_log(kind,detail) VALUES (?,?)').bind('digest', digest.text.slice(0, 500)).run();
+        }
+        const days = parseInt((await getSettings(env)).retention_days || '0', 10) || 0;
+        if (days > 0) {
+          const r = await env.DB.prepare('DELETE FROM applications WHERE created_at < datetime(' + "'" + 'now' + "'" + ', ?)').bind('-' + days + ' days').run();
+          if (r && r.meta && r.meta.changes) await logActivity(env, 'system', 'retention_purge', null, `${r.meta.changes} leads older than ${days} days`);
+        }
+      }
+    } catch (e) {
+      try { await logError(env, 'scheduled: ' + (e && e.message ? e.message : e), 'scheduled'); } catch { /* ignore */ }
+    }
+  },
+  async fetch(request, env, ctx) {
+    let res;
+    try {
+      res = await handleRequest(request, env, ctx);
+    } catch (err) {
+      res = json({ ok: false, error: 'Server error.' }, 500);
+    }
+    const h = new Headers(res.headers);
+    for (const [k, v] of Object.entries(securityHeaders((h.get('content-type') || '').includes('text/html')))) {
+      if (!h.has(k)) h.set(k, v);
+    }
+    const pathname = new URL(request.url).pathname;
+    if (pathname.startsWith('/admin')) h.set('X-Robots-Tag', 'noindex, nofollow');
+    /* every public API response carries CORS when the caller is allowed -
+       applied centrally so no individual route can forget it */
+    if (pathname.startsWith('/api/') || pathname.startsWith('/v1/')) {
+      const origin = request.headers.get('origin');
+      if (origin && !h.has('Access-Control-Allow-Origin')) {
+        const origins = await allowedOrigins(env);
+        if (origins.has(origin)) {
+          h.set('Access-Control-Allow-Origin', origin);
+          h.set('Vary', 'Origin');
+        }
+      }
+    }
+    if (request.method === 'HEAD') return new Response(null, { status: res.status, headers: h });
+    return new Response(res.body, { status: res.status, headers: h });
   },
 };
