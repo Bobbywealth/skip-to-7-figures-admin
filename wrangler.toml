@@ -11,3 +11,7 @@ database_id = "5f8e95c9-d790-4ee2-9b28-ed6f56c861af"
 
 [observability]
 enabled = true
+
+# Daily 4:00 AM ET digest to Telegram + retention purge
+[triggers]
+crons = ["0 11 * * *"]
