@@ -1,0 +1,13 @@
+name = "skip-to-7-figures-admin"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+# Durable lead + admin database (Cloudflare D1, free tier)
+[[d1_databases]]
+binding = "DB"
+database_name = "skip7figures"
+database_id = "5f8e95c9-d790-4ee2-9b28-ed6f56c861af"
+
+[observability]
+enabled = true
