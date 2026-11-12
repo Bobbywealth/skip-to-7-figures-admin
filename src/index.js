@@ -430,13 +430,15 @@ async function handleTrack(request, env) {
   if (!path) path = clean(body.path, 120) || '/';
   const name = clean(body.name, 40) || 'view';
   const day = new Date().toISOString().slice(0, 10);
-  await env.DB.prepare(
-    `INSERT INTO visits(day,path,count) VALUES (?,?,1)
-     ON CONFLICT(day,path) DO UPDATE SET count = count + 1`
-  ).bind(day, path).run();
-  if (name !== 'view') {
-    await recordEvent(env, name, path, clean(body.visitor_id, 64), body.data || {});
+  /* only real page views count as views - counting every event here would
+     inflate the denominator and understate the conversion rate */
+  if (name === 'view') {
+    await env.DB.prepare(
+      `INSERT INTO visits(day,path,count) VALUES (?,?,1)
+       ON CONFLICT(day,path) DO UPDATE SET count = count + 1`
+    ).bind(day, path).run();
   }
+  await recordEvent(env, name, path, clean(body.visitor_id, 64), body.data || {});
   return json({ ok: true });
 }
 
