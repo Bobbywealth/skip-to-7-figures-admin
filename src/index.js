@@ -1010,6 +1010,8 @@ select.search{padding:12px 14px;border:1px solid var(--line);border-radius:10px;
 .btn,.btn.sm{min-height:44px;display:inline-flex;align-items:center;justify-content:center}
 input,select,textarea{min-height:44px;font-size:16px}
 .mini li{padding:10px 0}
+/* the top nav links were 33px tall */
+.top nav a,.top nav button{min-height:44px;display:inline-flex;align-items:center}
 /* a long applicant name must wrap instead of stretching the table */
 .who b{overflow-wrap:anywhere;word-break:break-word}
 /* the row-select checkbox needs a real target */
