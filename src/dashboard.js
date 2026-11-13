@@ -96,7 +96,7 @@ export function dashboardPage(data, csrf) {
       return `<div class="drawer" id="d-${esc(r.id)}">
       <div class="drawer__head">
         <div><h3 style="font-size:1.3rem">${esc(r.name || 'Applicant')} <span class="score ${band(r.score)}">${esc(r.score || 0)}</span></h3>
-        <p class="muted" style="margin:2px 0 0;font-size:.86rem">${esc(when(r.created_at))} · ${esc(r.source || 'funnel')} · ${esc(r.device || '')} ${esc(r.country || '')}</p></div>
+        <p class="muted" style="margin:2px 0 0;font-size:.86rem">${esc(when(r.created_at))} · ${esc(r.source_label || r.source || 'funnel')} · ${esc(r.device || '')} ${esc(r.country || '')}</p></div>
         <span class="pill ${esc(st)}">${esc(STAGE_LABELS[st] || st)}</span>
       </div>
       <dl class="kv">
@@ -154,7 +154,7 @@ export function dashboardPage(data, csrf) {
   const settings = data.settings || {};
 
   return `<div class="top"><div class="top__in">
-      <div class="top__brand"><img src="https://skip-to-7-figures.onrender.com/favicon.png" alt=""><span>Skip to 7 Figures</span></div>
+      <div class="top__brand"><img src="https://skip-to-7-figures.skip7figures.workers.dev/favicon.png" alt="" width="24" height="24"><span>Skip to 7 Figures</span></div>
       <nav>
         <a href="https://skip-to-7-figures.onrender.com/" target="_blank" rel="noopener">View site ↗</a>
         <a href="/admin/export.csv">Export CSV</a>
