@@ -67,7 +67,7 @@ CREATE TABLE applications (
   referrer    TEXT NOT NULL DEFAULT '',
   user_agent  TEXT NOT NULL DEFAULT '',
   ip_hash     TEXT NOT NULL DEFAULT ''
-, stage       TEXT NOT NULL DEFAULT 'new', score       INTEGER NOT NULL DEFAULT 0, owner       TEXT NOT NULL DEFAULT '', spam        INTEGER NOT NULL DEFAULT 0, duplicate_of INTEGER, last_contacted_at TEXT, notes_updated_at  TEXT, notes_author      TEXT NOT NULL DEFAULT '', utm_source   TEXT NOT NULL DEFAULT '', utm_medium   TEXT NOT NULL DEFAULT '', utm_campaign TEXT NOT NULL DEFAULT '', utm_content  TEXT NOT NULL DEFAULT '', utm_term     TEXT NOT NULL DEFAULT '', gclid       TEXT NOT NULL DEFAULT '', fbclid      TEXT NOT NULL DEFAULT '', device      TEXT NOT NULL DEFAULT '', country     TEXT NOT NULL DEFAULT '', visitor_id  TEXT NOT NULL DEFAULT '', delete_token TEXT NOT NULL DEFAULT '')
+, stage       TEXT NOT NULL DEFAULT 'new', score       INTEGER NOT NULL DEFAULT 0, owner       TEXT NOT NULL DEFAULT '', spam        INTEGER NOT NULL DEFAULT 0, flagged      INTEGER NOT NULL DEFAULT 0, duplicate_of INTEGER, last_contacted_at TEXT, notes_updated_at  TEXT, notes_author      TEXT NOT NULL DEFAULT '', utm_source   TEXT NOT NULL DEFAULT '', utm_medium   TEXT NOT NULL DEFAULT '', utm_campaign TEXT NOT NULL DEFAULT '', utm_content  TEXT NOT NULL DEFAULT '', utm_term     TEXT NOT NULL DEFAULT '', gclid       TEXT NOT NULL DEFAULT '', fbclid      TEXT NOT NULL DEFAULT '', device      TEXT NOT NULL DEFAULT '', country     TEXT NOT NULL DEFAULT '', visitor_id  TEXT NOT NULL DEFAULT '', delete_token TEXT NOT NULL DEFAULT '')
 
 CREATE TABLE content (
   key   TEXT PRIMARY KEY,

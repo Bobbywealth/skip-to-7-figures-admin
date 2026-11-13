@@ -78,7 +78,7 @@ export function dashboardPage(data, csrf) {
       return `<tr class="row${dup}${spam}" data-id="${esc(r.id)}" data-stage="${esc(r.stage || 'new')}" data-source="${esc((r.source_label || r.utm_source || 'direct').toLowerCase())}" data-owner="${esc((r.owner || '').toLowerCase())}" data-date="${esc(String(r.created_at || '').slice(0,10))}" data-search="${esc([r.name, r.email, r.phone, r.capital, r.interest, r.utm_campaign, r.referrer].join(' ').toLowerCase())}">
         <td><input type="checkbox" class="pick" data-id="${esc(r.id)}" aria-label="Select lead ${esc(r.id)}"></td>
         <td class="mono hide" style="white-space:nowrap;color:var(--muted)">${esc(when(r.created_at))}</td>
-        <td class="who"><b>${esc(r.name || '—')}${r.duplicate_of ? ' <span class="tag">dup</span>' : ''}${r.spam ? ' <span class="tag tag--bad">spam</span>' : ''}</b>
+        <td class="who"><b>${esc(r.name || '—')}${r.duplicate_of ? ' <span class="tag">dup</span>' : ''}${r.flagged ? ' <span class="tag tag--warn">unverified</span>' : ''}${r.spam ? ' <span class="tag tag--bad">spam</span>' : ''}</b>
           <a href="mailto:${esc(r.email)}">${esc(r.email)}</a>
           <a href="tel:${esc(r.phone)}">${esc(r.phone)}</a></td>
         <td><span class="score ${band(r.score)}">${esc(r.score || 0)}</span></td>
@@ -158,7 +158,7 @@ export function dashboardPage(data, csrf) {
       <nav>
         <a href="https://skip-to-7-figures.onrender.com/" target="_blank" rel="noopener">View site ↗</a>
         <a href="/admin/export.csv">Export CSV</a>
-        <form method="post" action="/admin/logout" style="display:inline"><button type="submit">Sign out</button></form>
+        <form method="post" action="/admin/logout" id="logoutForm" style="display:inline"><button type="submit">Sign out</button></form>
       </nav>
     </div></div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
@@ -227,9 +227,9 @@ export function dashboardPage(data, csrf) {
           <button class="btn sm ghost" id="bulkClear">Clear</button>
         </div>
         ${(data.totalRows||rows.length) > rows.length ? `<p class="hint" style="margin:0 0 12px">Showing the ${rows.length} most recent of ${data.totalRows}. <a href="/admin/dashboard?limit=200">Show 200</a> · <a href="/admin/dashboard?limit=500">Show all</a></p>` : ''}
-        ${rows.length ? `<table><thead><tr>
+        ${rows.length ? `<div class="tablewrap"><table><thead><tr>
           <th style="width:28px"></th><th class="hide">When</th><th>Applicant</th><th>Score</th><th class="hide">Capital</th><th>Stage</th><th class="hide">Source</th><th></th>
-        </tr></thead><tbody id="tbody">${tableRows}</tbody></table>` : `<div class="empty"><b>No applications yet</b>When someone completes the form on the funnel it will land here.</div>`}
+        </tr></thead><tbody id="tbody">${tableRows}</tbody></table></div>` : `<div class="empty"><b>No applications yet</b>When someone completes the form on the funnel it will land here.</div>`}
       </div>
 
       <div class="twocol">
@@ -362,7 +362,13 @@ export function dashboardPage(data, csrf) {
     $$('[data-del]').forEach(b=>b.addEventListener('click',async()=>{
       if(!confirm('Delete this lead permanently?')) return;
       const r=await api('/admin/application/'+b.dataset.del,null,'DELETE');
-      if(r.ok){b.closest('.drawer').remove();toast('Deleted',true);}else toast('Could not delete',false);
+      if(r.ok){
+        const dr=b.closest('.drawer');
+        const id=dr?dr.id.replace('d-',''):null;
+        if(dr) dr.remove();
+        if(id){const row=document.querySelector('#tbody tr[data-id="'+id+'"]');if(row)row.remove();}
+        toast('Deleted',true);
+      }else toast('Could not delete',false);
     }));
     $$('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{
       const id=b.dataset.copy;
@@ -396,6 +402,15 @@ export function dashboardPage(data, csrf) {
         }catch(err){ toast('Could not copy - the details are on screen',false); }
       }
     }));
+    /* the logout form is a plain POST, so the CSRF token goes on as a header */
+    const logoutForm=document.getElementById('logoutForm');
+    if(logoutForm){
+      logoutForm.addEventListener('submit',async(ev)=>{
+        ev.preventDefault();
+        const r=await api('/admin/logout',null,'POST');
+        if(r.ok) location.href='/admin';
+      });
+    }
     $$('[data-rmadmin]').forEach(b=>b.addEventListener('click',async()=>{
       if(!confirm('Remove this admin user?'))return;
       const r=await api('/admin/admins/'+b.dataset.rmadmin,null,'DELETE');
@@ -403,11 +418,19 @@ export function dashboardPage(data, csrf) {
       else toast(r.error||'Could not remove',false);
     }));
     /* open rows */
-    $$('[data-open]').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();document.querySelector('#d-'+b.dataset.open).classList.toggle('open');}));
+    $$('[data-open]').forEach(b=>b.addEventListener('click',e=>{
+      e.stopPropagation();
+      const dr=document.querySelector('#d-'+b.dataset.open);
+      if(!dr) return;
+      dr.classList.toggle('open');
+      if(dr.classList.contains('open')) dr.scrollIntoView({block:'nearest',behavior:'smooth'});
+    }));
     $$('tr.row').forEach(tr=>tr.addEventListener('click',(ev)=>{
       if(ev.target && ev.target.closest('.pick')) return;
-      const d=document.querySelector('#d-'+tr.dataset.id);
-      if(d) d.classList.toggle('open');
+      const dr=document.querySelector('#d-'+tr.dataset.id);
+      if(!dr) return;
+      dr.classList.toggle('open');
+      if(dr.classList.contains('open')) dr.scrollIntoView({block:'nearest',behavior:'smooth'});
     }));
     /* filters */
     let stageF='all', srcF='', fromF='', toF='';

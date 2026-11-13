@@ -464,7 +464,7 @@ async function handleApply(request, env, ctx) {
 
   /* daily cap so a bot cannot flood the dashboard or the alert channel */
   const todayCount = await env.DB.prepare(
-    "SELECT COUNT(*) AS c FROM applications WHERE spam = 1 AND created_at > datetime('now','-1 day')"
+    "SELECT COUNT(*) AS c FROM applications WHERE (spam = 1 OR flagged = 1) AND created_at > datetime('now','-1 day')"
   ).first();
   if (todayCount && todayCount.c >= 100) {
     await alertOwner(env, 'Application cap reached (100 in 24h) - further submissions are being refused.');
@@ -498,9 +498,8 @@ async function handleApply(request, env, ctx) {
 
   const res = await env.DB.prepare(
     `INSERT INTO applications
-      (name,email,phone,capital,timeline,experience,interest,decision,source,page_url,referrer,user_agent,ip_hash,
-       stage,score,owner,spam,duplicate_of,utm_source,utm_medium,utm_campaign,utm_content,utm_term,gclid,fbclid,device,country,visitor_id,delete_token)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,'',?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      (name,email,phone,capital,timeline,experience,interest,decision,source,page_url,referrer,user_agent,ip_hash,stage,score,owner,spam,flagged,duplicate_of,utm_source,utm_medium,utm_campaign,utm_content,utm_term,gclid,fbclid,device,country,visitor_id,delete_token)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,'',0,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   )
     .bind(
       name, email, phone, answers.capital, answers.timeline, answers.experience, answers.interest, answers.decision,
@@ -813,8 +812,8 @@ async function handleSaveContent(request, env) {
 }
 
 async function handleExport(request, env) {
-  const rows = await env.DB.prepare('SELECT * FROM applications ORDER BY id DESC').all();
-  const header = ['id', 'created_at', 'name', 'email', 'phone', 'capital', 'timeline', 'experience', 'interest', 'decision', 'stage', 'score', 'owner', 'source', 'utm_source', 'utm_campaign', 'notes'];
+  const rows = await env.DB.prepare('SELECT * FROM applications ORDER BY id DESC LIMIT 10000').all();
+  const header = ['id', 'created_at', 'name', 'email', 'phone', 'capital', 'timeline', 'experience', 'interest', 'decision', 'stage', 'score', 'owner', 'source', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'gclid', 'fbclid', 'device', 'country', 'notes'];
   const lines = [header.join(',')];
   for (const r of rows.results || []) {
     lines.push(header.map((h) => csvCell(r[h])).join(','));
@@ -828,7 +827,9 @@ async function handleExport(request, env) {
   });
 }
 function csvCell(v) {
-  const s = String(v == null ? '' : v);
+  let s = String(v == null ? '' : v);
+  /* a cell starting with = + - @ is executed by Excel and Sheets - neutralise it */
+  if(/^[=+\-@]/.test(s)) s="'"+s;
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
@@ -983,6 +984,41 @@ tr.row:hover{background:#FBF8F2}
 .pre{background:#F4F1EA;border:1px solid var(--line);border-radius:10px;padding:12px;font:500 .78rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-all;margin:12px 0 0}
 .drawer__head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 select.search{padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--cream);font:400 .95rem/1.3 var(--sans);color:var(--ink)}
+
+/* ---------- phone: these come LAST so they win over the layout above ---------- */
+.stats{grid-template-columns:repeat(2,1fr)}
+.twocol{grid-template-columns:1fr}
+.grid2{grid-template-columns:1fr}
+/* a grid track must be allowed to shrink below its content width, or the
+   fixed-width bars inside push the whole page sideways */
+.stats>*,.twocol>*,.grid2>*{min-width:0}
+/* the pipeline and funnel bars have fixed label columns that are too wide
+   for a 390px screen */
+.pipe{grid-template-columns:30px 1fr 66px;gap:8px;min-height:44px}
+.pipe__l{font-size:.76rem;overflow-wrap:anywhere}
+.fbar__l{width:78px;font-size:.76rem}
+.fbar__n{width:36px;font-size:.86rem}
+/* the applications table scrolls inside its card instead of pushing the page */
+.tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -4px;padding:0 4px}
+.tablewrap table{min-width:460px}
+/* a drawer on a phone is a full screen sheet */
+.drawer{width:100%;max-width:100%;max-height:88vh}
+.toolbar{flex-wrap:wrap;gap:8px}
+.chips{flex-wrap:wrap}
+.chip{min-height:40px;display:inline-flex;align-items:center}
+/* every tappable thing needs a 44px target on a phone */
+.btn,.btn.sm{min-height:44px;display:inline-flex;align-items:center;justify-content:center}
+input,select,textarea{min-height:44px;font-size:16px}
+.mini li{padding:10px 0}
+/* a long applicant name must wrap instead of stretching the table */
+.who b{overflow-wrap:anywhere;word-break:break-word}
+/* the row-select checkbox needs a real target */
+.pick{width:20px;height:20px;min-width:20px}
+input[type=checkbox]{width:20px;height:20px;accent-color:var(--gold)}
+/* a long toast must not run off the screen */
+.toast{max-width:calc(100vw - 32px);text-align:center}
+/* the day labels under the chart were 9.9px */
+.day em{font-size:.7rem}
 </style></head><body>${body}</body></html>`;
 }
 
@@ -1068,6 +1104,11 @@ async function handleRequest(request, env, ctx) {
       if (path === '/admin/logout' && method === 'POST') {
         const s = await readSession(env.SESSION_SECRET, request, env);
         if (!s) return json({ ok: false, error: 'Not signed in.' }, 401);
+        /* a cross-site form must not be able to sign the admin out */
+        const logoutToken = request.headers.get('x-csrf-token');
+        if (!logoutToken || !constantTimeEqual(String(logoutToken), String(s.csrf))) {
+          return json({ ok: false, error: 'Invalid CSRF token.' }, 403);
+        }
         return await handleLogout(request, env, s);
       }
 
