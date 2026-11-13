@@ -118,7 +118,8 @@ async function readSession(secret, request, env) {
     if (!payload.exp || payload.exp < Date.now()) return null;
     if (env && payload.sid) {
       const row = await env.DB.prepare('SELECT revoked FROM admin_sessions WHERE id = ?').bind(payload.sid).first();
-      if (row && row.revoked) return null;
+      /* fail closed: no session row means the session is not valid */
+      if (!row || row.revoked) return null;
       try { await env.DB.prepare("UPDATE admin_sessions SET last_seen = datetime('now') WHERE id = ?").bind(payload.sid).run(); } catch { /* ignore */ }
     }
     return payload;
@@ -352,7 +353,12 @@ async function recordEvent(env, name, path, visitorId, data) {
 }
 
 async function deliverWebhooks(env, event, payload) {
-  const rows = await env.DB.prepare("SELECT url FROM webhook_out WHERE event = ? OR event = '*'").bind(String(event)).all();
+  /* only rows still marked 'configured' are endpoints - the delivery log
+     shares this table, so reading it without the filter would fire the first
+     webhook once per stored delivery */
+  const rows = await env.DB.prepare(
+    "SELECT DISTINCT url FROM webhook_out WHERE status = 'configured' AND (event = ? OR event = '*')"
+  ).bind(String(event)).all();
   const urls = (rows.results || []).map((r) => r.url).filter(Boolean);
   for (const url of urls.slice(0, 5)) {
     try {
@@ -458,7 +464,7 @@ async function handleApply(request, env, ctx) {
 
   /* daily cap so a bot cannot flood the dashboard or the alert channel */
   const todayCount = await env.DB.prepare(
-    "SELECT COUNT(*) AS c FROM applications WHERE created_at > datetime('now','-1 day')"
+    "SELECT COUNT(*) AS c FROM applications WHERE spam = 1 AND created_at > datetime('now','-1 day')"
   ).first();
   if (todayCount && todayCount.c >= 100) {
     await alertOwner(env, 'Application cap reached (100 in 24h) - further submissions are being refused.');
@@ -485,7 +491,7 @@ async function handleApply(request, env, ctx) {
   // duplicate detection: same email again inside 30 days
   let duplicateOf = null;
   const dupe = await env.DB.prepare(
-    `SELECT id FROM applications WHERE email = ? AND id <> coalesce((SELECT id FROM applications WHERE 0), -1)
+    `SELECT id FROM applications WHERE email = ?
        AND created_at > datetime('now','-30 days') ORDER BY id DESC LIMIT 1`
   ).bind(email).first();
   if (dupe && dupe.id) duplicateOf = dupe.id;
@@ -540,7 +546,7 @@ async function handleContent(request, env) {
   const rows = await env.DB.prepare('SELECT key, value FROM content').all();
   const out = {};
   /* D1 returns rows under .results — NOT .rows (that is the node-postgres shape) */
-  for (const r of rows.results || []) if (r.value) out[r.key] = r.value;
+  for (const r of rows.results || []) out[r.key] = r.value || '';
   return json(out);
 }
 
@@ -606,7 +612,12 @@ async function handleLogin(request, env) {
   });
 }
 
-async function handleLogout(request, env) {
+async function handleLogout(request, env, session) {
+  try {
+    if (session && session.sid) {
+      await env.DB.prepare('UPDATE admin_sessions SET revoked = 1 WHERE id = ?').bind(session.sid).run();
+    }
+  } catch { /* the cookie is cleared regardless */ }
   return html('<meta http-equiv="refresh" content="0;url=/admin">', 302, {
     'Set-Cookie': clearCookie(),
     'Cache-Control': 'no-store',
@@ -650,7 +661,15 @@ async function dashboardData(env) {
   const views = await env.DB.prepare(
     `SELECT COALESCE(SUM(count),0) AS total, COALESCE(SUM(CASE WHEN day >= date('now','-6 days') THEN count ELSE 0 END),0) AS week FROM visits`
   ).first();
-  const list = await env.DB.prepare('SELECT * FROM applications ORDER BY id DESC LIMIT 500').all();
+  const list = await env.DB.prepare(
+    `SELECT *, COALESCE(NULLIF(utm_source,''),
+        CASE WHEN referrer LIKE '%instagram%' THEN 'instagram'
+             WHEN referrer LIKE '%facebook%' THEN 'facebook'
+             WHEN referrer LIKE '%tiktok%' THEN 'tiktok'
+             WHEN referrer LIKE '%google%' THEN 'google'
+             WHEN referrer != '' THEN 'other' ELSE 'direct' END) AS source_label
+     FROM applications ORDER BY id DESC LIMIT 500`
+  ).all();
   const content = await env.DB.prepare('SELECT key, value FROM content').all();
   const daily = await env.DB.prepare(
     `SELECT d.day,
@@ -726,6 +745,21 @@ async function handleUpdateApplication(request, env, session, id) {
     binds.push(body.spam ? 1 : 0);
     changes.push(body.spam ? 'marked spam' : 'unmarked spam');
   }
+  if (typeof body.name === 'string') {
+    sets.push('name = ?');
+    binds.push(clean(body.name, 120));
+    changes.push('name');
+  }
+  if (typeof body.email === 'string' && isEmail(clean(body.email, 160))) {
+    sets.push('email = ?');
+    binds.push(clean(body.email, 160).toLowerCase());
+    changes.push('email');
+  }
+  if (typeof body.phone === 'string') {
+    sets.push('phone = ?');
+    binds.push(clean(body.phone, 40));
+    changes.push('phone');
+  }
   if (typeof body.notes === 'string') {
     sets.push('notes = ?', "notes_updated_at = datetime('now')", 'notes_author = ?');
     binds.push(clean(body.notes, 2000), String(session.sub || '').slice(0, 120));
@@ -741,7 +775,10 @@ async function handleUpdateApplication(request, env, session, id) {
   }
   if (!sets.length) return json({ ok: false, error: 'Nothing to update.' }, 400);
   binds.push(id);
-  await env.DB.prepare(`UPDATE applications SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  const changed = await env.DB.prepare(`UPDATE applications SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  if (!changed || !changed.meta || !changed.meta.changes) {
+    return json({ ok: false, error: 'That application no longer exists.' }, 404);
+  }
   await logActivity(env, session.sub, 'updated', id, changes.join(', '));
   return json({ ok: true });
 }
@@ -763,7 +800,7 @@ async function handleSaveContent(request, env) {
 
 async function handleExport(request, env) {
   const rows = await env.DB.prepare('SELECT * FROM applications ORDER BY id DESC').all();
-  const header = ['id', 'created_at', 'name', 'email', 'phone', 'capital', 'timeline', 'experience', 'interest', 'decision', 'stage', 'score', 'owner', 'source', 'utm_source', 'utm_campaign', 'status', 'notes'];
+  const header = ['id', 'created_at', 'name', 'email', 'phone', 'capital', 'timeline', 'experience', 'interest', 'decision', 'stage', 'score', 'owner', 'source', 'utm_source', 'utm_campaign', 'notes'];
   const lines = [header.join(',')];
   for (const r of rows.results || []) {
     lines.push(header.map((h) => csvCell(r[h])).join(','));
@@ -924,6 +961,11 @@ tr.row:hover{background:#FBF8F2}
 .day em{position:absolute;bottom:-16px;left:0;right:0;text-align:center;font:500 .62rem/1 var(--mono);color:var(--muted);font-style:normal}
 .bulk{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px 14px;margin-bottom:14px;background:#FBF6EA;border:1px solid var(--lineg);border-radius:12px}
 .bulk span{font:600 .84rem/1 var(--sans)}
+[hidden]{display:none!important}
+.toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);z-index:90;padding:12px 18px;border-radius:100px;font:600 .88rem/1 var(--sans);opacity:0;pointer-events:none;transition:opacity .22s var(--ease),transform .22s var(--ease);box-shadow:0 14px 40px -18px rgba(27,22,17,.6)}
+.toast--show{opacity:1;transform:translate(-50%,0)}
+.toast--ok{background:#1F5C3A;color:#F3F8F4}
+.toast--bad{background:#8A2E22;color:#FDF3F1}
 .pre{background:#F4F1EA;border:1px solid var(--line);border-radius:10px;padding:12px;font:500 .78rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-all;margin:12px 0 0}
 .drawer__head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 select.search{padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--cream);font:400 .95rem/1.3 var(--sans);color:var(--ink)}
@@ -1007,7 +1049,11 @@ async function handleRequest(request, env, ctx) {
         }
         if (method === 'POST') return await handleLogin(request, env);
       }
-      if (path === '/admin/logout' && method === 'POST') return await handleLogout(request, env);
+      if (path === '/admin/logout' && method === 'POST') {
+        const s = await readSession(env.SESSION_SECRET, request, env);
+        if (!s) return json({ ok: false, error: 'Not signed in.' }, 401);
+        return await handleLogout(request, env, s);
+      }
 
       if (path === '/admin/dashboard' && method === 'GET') {
         const session = await readSession(env.SESSION_SECRET, request, env);
@@ -1019,7 +1065,7 @@ async function handleRequest(request, env, ctx) {
         if (!session) return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'no-store' } });
         return await handleExport(request, env);
       }
-      if (path.startsWith('/admin/application/') && method === 'POST') {
+      if (path.startsWith('/admin/application/') && path !== '/admin/application/bulk' && method === 'POST') {
         const session = await readSession(env.SESSION_SECRET, request, env);
         if (!session) return json({ ok: false, error: 'Not signed in.' }, 401);
         const token = request.headers.get('x-csrf-token');
@@ -1036,13 +1082,18 @@ async function handleRequest(request, env, ctx) {
         return await handleSaveContent(request, env);
       }
 
-      /* ---- authenticated admin API ---- */
+      /* ---- authenticated admin API ----
+         EVERY /admin/* route needs a signed-in admin - including the JSON GETs.
+         The dashboard page and the CSV export are handled above and redirect
+         themselves; everything below this line is protected here. */
       let session = null;
-      if (path.startsWith('/admin/') && request.method !== 'GET') {
+      if (path.startsWith('/admin/')) {
         session = await readSession(env.SESSION_SECRET, request, env);
         if (!session) return json({ ok: false, error: 'Not signed in.' }, 401);
-        const token = request.headers.get('x-csrf-token');
-        if (!token || !constantTimeEqual(String(token), String(session.csrf))) return json({ ok: false, error: 'Invalid CSRF token.' }, 403);
+        if (request.method !== 'GET') {
+          const token = request.headers.get('x-csrf-token');
+          if (!token || !constantTimeEqual(String(token), String(session.csrf))) return json({ ok: false, error: 'Invalid CSRF token.' }, 403);
+        }
       }
 
       if (path === '/admin/application/bulk' && method === 'POST') {
@@ -1057,7 +1108,7 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, updated: ids.length });
       }
 
-      if (path.startsWith('/admin/application/') && request.method === 'DELETE') {
+      if (path.startsWith('/admin/application/') && path !== '/admin/application/bulk' && request.method === 'DELETE') {
         const id = parseInt(path.split('/').pop(), 10);
         if (!id) return json({ ok: false }, 400);
         await env.DB.prepare('DELETE FROM applications WHERE id = ?').bind(id).run();
@@ -1065,7 +1116,7 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true });
       }
 
-      if (path.startsWith('/admin/application/') && method === 'GET') {
+      if (path.startsWith('/admin/application/') && path !== '/admin/application/bulk' && method === 'GET') {
         const id = parseInt(path.split('/').pop(), 10);
         const row = await env.DB.prepare('SELECT * FROM applications WHERE id = ?').bind(id).first();
         if (!row) return json({ ok: false, error: 'Not found.' }, 404);
@@ -1123,13 +1174,15 @@ async function handleRequest(request, env, ctx) {
         if (!isEmail(email) || password.length < 12) return json({ ok: false, error: 'Valid email and a 12+ character password required.' }, 400);
         const salt = b64url(crypto.getRandomValues(new Uint8Array(16)));
         const hash = await pbkdf2(password, salt, 100000);
-        await env.DB.prepare('INSERT INTO admins(email,password_hash,salt,iterations) VALUES (?,?,?,100000) ON CONFLICT(email) DO UPDATE SET password_hash=excluded.password_hash, salt=excluded.salt').bind(email, hash, salt).run();
+        await env.DB.prepare('INSERT INTO admins(email,password_hash,salt,iterations) VALUES (?,?,?,100000) ON CONFLICT(email) DO UPDATE SET password_hash=excluded.password_hash, salt=excluded.salt, iterations=excluded.iterations').bind(email, hash, salt).run();
         await logActivity(env, session.sub, 'admin_added', null, email);
         return json({ ok: true });
       }
-      if (path.startsWith('/admin/admins/') && request.method === 'DELETE') {
-        const id = parseInt(path.split('/').pop(), 10);
-        await env.DB.prepare('DELETE FROM admins WHERE id = ?').bind(id).run();
+        if (path.startsWith('/admin/admins/') && method === 'DELETE') {
+const id = parseInt(path.split('/').pop(), 10);
+const self = await env.DB.prepare('SELECT id FROM admins WHERE email = ?').bind(session.sub).first();
+if (self && self.id === id) return json({ ok: false, error: 'You cannot remove the account you are signed in with.' }, 400);
+await env.DB.prepare('DELETE FROM admins WHERE id = ?').bind(id).run();
         await logActivity(env, session.sub, 'admin_removed', id, '');
         return json({ ok: true });
       }
@@ -1140,12 +1193,21 @@ async function handleRequest(request, env, ctx) {
         if (next.length < 12) return json({ ok: false, error: 'New password must be at least 12 characters.' }, 400);
         const admin = await env.DB.prepare('SELECT * FROM admins WHERE email = ?').bind(session.sub).first();
         if (!admin) return json({ ok: false, error: 'Admin not found.' }, 404);
-        const check = await pbkdf2(current, admin.salt, admin.iterations || 100000);
-        if (!constantTimeEqual(check, admin.password_hash)) return json({ ok: false, error: 'Current password is incorrect.' }, 401);
+            let check = '';
+try {
+check = await pbkdf2(current, admin.salt, admin.iterations || 100000);
+} catch {
+return json({ ok: false, error: 'Current password is incorrect.' }, 401);
+}
+if (!constantTimeEqual(check, admin.password_hash)) return json({ ok: false, error: 'Current password is incorrect.' }, 401);
         const salt = b64url(crypto.getRandomValues(new Uint8Array(16)));
         const hash = await pbkdf2(next, salt, 100000);
-        await env.DB.prepare('UPDATE admins SET password_hash = ?, salt = ?, iterations = 100000 WHERE id = ?').bind(hash, salt, admin.id).run();
-        await logActivity(env, session.sub, 'password_changed', null, '');
+          await env.DB.prepare('UPDATE admins SET password_hash = ?, salt = ?, iterations = 100000 WHERE id = ?').bind(hash, salt, admin.id).run();
+/* every other signed-in session for this admin is now invalid */
+try {
+await env.DB.prepare('UPDATE admin_sessions SET revoked = 1 WHERE email = ? AND id <> ?').bind(session.sub, session.sid || '').run();
+} catch { /* ignore */ }
+await logActivity(env, session.sub, 'password_changed', null, '');
         return json({ ok: true });
       }
 
@@ -1162,7 +1224,7 @@ async function handleRequest(request, env, ctx) {
       }
 
       if (path === '/admin/webhooks' && method === 'GET') {
-        const rows = await env.DB.prepare('SELECT * FROM webhook_out ORDER BY id DESC LIMIT 50').all();
+        const rows = await env.DB.prepare("SELECT * FROM webhook_out WHERE status = 'configured' ORDER BY id DESC LIMIT 50").all();
         return json({ ok: true, deliveries: rows.results || [] });
       }
       if (path === '/admin/webhooks' && method === 'POST') {

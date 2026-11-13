@@ -75,7 +75,7 @@ export function dashboardPage(data, csrf) {
     .map((r) => {
       const dup = r.duplicate_of ? ' dup' : '';
       const spam = r.spam ? ' spam' : '';
-      return `<tr class="row${dup}${spam}" data-id="${esc(r.id)}" data-stage="${esc(r.stage || 'new')}" data-source="${esc((r.utm_source || '').toLowerCase())}" data-owner="${esc((r.owner || '').toLowerCase())}" data-search="${esc([r.name, r.email, r.phone, r.capital, r.interest, r.utm_campaign, r.referrer].join(' ').toLowerCase())}">
+      return `<tr class="row${dup}${spam}" data-id="${esc(r.id)}" data-stage="${esc(r.stage || 'new')}" data-source="${esc((r.source_label || r.utm_source || 'direct').toLowerCase())}" data-owner="${esc((r.owner || '').toLowerCase())}" data-date="${esc(String(r.created_at || '').slice(0,10))}" data-search="${esc([r.name, r.email, r.phone, r.capital, r.interest, r.utm_campaign, r.referrer].join(' ').toLowerCase())}">
         <td><input type="checkbox" class="pick" data-id="${esc(r.id)}" aria-label="Select lead ${esc(r.id)}"></td>
         <td class="mono hide" style="white-space:nowrap;color:var(--muted)">${esc(when(r.created_at))}</td>
         <td class="who"><b>${esc(r.name || '—')}${r.duplicate_of ? ' <span class="tag">dup</span>' : ''}${r.spam ? ' <span class="tag tag--bad">spam</span>' : ''}</b>
@@ -83,7 +83,7 @@ export function dashboardPage(data, csrf) {
           <a href="tel:${esc(r.phone)}">${esc(r.phone)}</a></td>
         <td><span class="score ${band(r.score)}">${esc(r.score || 0)}</span></td>
         <td class="hide">${esc(r.capital)}</td>
-        <td><span class="pill ${esc(r.stage || 'new')}">${esc(STAGE_LABELS[r.stage || 'new'] || r.stage)}</span></td>
+        <td class="pill-cell"><span class="pill ${esc(r.stage || 'new')}">${esc(STAGE_LABELS[r.stage || 'new'] || r.stage)}</span></td>
         <td class="hide">${esc(r.utm_source || (r.referrer ? 'referral' : 'direct'))}</td>
         <td><button class="btn sm ghost" data-open="${esc(r.id)}">Open</button></td>
       </tr>`;
@@ -121,7 +121,7 @@ export function dashboardPage(data, csrf) {
       <div class="rowact">
         ${stages.map((x) => `<button class="btn sm${x === st ? ' gold' : ' ghost'}" data-stage-set="${esc(x)}" data-target="${esc(r.id)}">${esc(STAGE_LABELS[x])}</button>`).join('')}
         <button class="btn sm gold" data-save="${esc(r.id)}">Save</button>
-        <button class="btn sm ghost" data-spam="${esc(r.id)}">${r.spam ? 'Not spam' : 'Mark spam'}</button>
+        <button class="btn sm ghost" data-spam="${esc(r.id)}" data-spam-state="${r.spam ? 1 : 0}">${r.spam ? 'Not spam' : 'Mark spam'}</button>
         <button class="btn sm ghost" data-del="${esc(r.id)}">Delete</button>
         <a class="btn sm ghost" href="mailto:${esc(r.email)}?subject=${encodeURIComponent('Skip to 7 Figures')}">Email</a>
       </div>
@@ -159,6 +159,7 @@ export function dashboardPage(data, csrf) {
         <form method="post" action="/admin/logout" style="display:inline"><button type="submit">Sign out</button></form>
       </nav>
     </div></div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <div class="wrap">
       <h1 class="page">Dashboard</h1>
       <p class="page__sub">Applications, pipeline and traffic for the Skip to 7 Figures funnel.</p>
@@ -214,7 +215,7 @@ export function dashboardPage(data, csrf) {
             <button class="chip" data-filter="hot">Hot</button>
           </div>
           <input class="search" id="q" type="search" placeholder="Search name, email, phone, answer…">
-          <select id="srcFilter" class="search"><option value="">All sources</option>${(data.sources || []).map((x) => `<option value="${esc((x.src || '').toLowerCase())}">${esc(x.src || 'direct')}</option>`).join('')}</select>
+          <select id="srcFilter" class="search"><option value="">All sources</option>${(data.sources || []).map((x) => `<option value="${esc((x.src || 'direct').toLowerCase())}">${esc(x.src || 'direct')}</option>`).join('')}</select>
           <input class="search" id="from" type="date" title="From date">
           <input class="search" id="to" type="date" title="To date">
         </div>
@@ -312,7 +313,14 @@ export function dashboardPage(data, csrf) {
     <script>
     const CSRF=${JSON.stringify(csrf)};
     const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
-    const toast=(m,ok,el)=>{const e=el||$('#contentMsg');if(!e)return;e.textContent=m;e.style.color=ok?'#1F5C3A':'#8A2E22';setTimeout(()=>e.textContent='',3000);};
+    const toast=(m,ok,el)=>{
+      const e=el||$('#toast');
+      if(!e)return;
+      e.textContent=m;
+      e.className='toast '+(ok?'toast--ok':'toast--bad')+' toast--show';
+      clearTimeout(e._t);
+      e._t=setTimeout(()=>e.classList.remove('toast--show'),3000);
+    };
     async function api(url,body,method){
       const r=await fetch(url,{method:method||'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},body:body?JSON.stringify(body):undefined});
       return r.json().catch(()=>({ok:false,error:'bad response'}));
@@ -320,7 +328,17 @@ export function dashboardPage(data, csrf) {
     /* stage + notes + fields */
     $$('[data-stage-set]').forEach(b=>b.addEventListener('click',async()=>{
       const id=b.dataset.target, r=await api('/admin/application/'+id,{stage:b.dataset.stageSet});
-      if(r.ok){const p=document.querySelector('#d-'+id+' .pill');if(p){p.textContent=b.textContent;p.className='pill '+b.dataset.stageSet;}toast('Stage updated',true);}else toast('Could not update',false);
+      if(r.ok){
+        const p=document.querySelector('#d-'+id+' .pill');
+        if(p){p.textContent=b.textContent;p.className='pill '+b.dataset.stageSet;}
+        const row=document.querySelector('#tbody tr[data-id="'+id+'"]');
+        if(row){
+          row.dataset.stage=b.dataset.stageSet;
+          const cell=row.querySelector('.pill-cell');
+          if(cell){cell.textContent=b.textContent;cell.className='pill-cell pill '+b.dataset.stageSet;}
+        }
+        toast('Stage updated',true);
+      }else toast('Could not update',false);
     }));
     $$('[data-save]').forEach(b=>b.addEventListener('click',async()=>{
       const id=b.dataset.save, body={notes:document.querySelector('#n-'+id).value};
@@ -329,8 +347,14 @@ export function dashboardPage(data, csrf) {
       toast(r.ok?'Saved':'Could not save',r.ok);
     }));
     $$('[data-spam]').forEach(b=>b.addEventListener('click',async()=>{
-      const r=await api('/admin/application/'+b.dataset.spam,{spam:true});
-      toast(r.ok?'Marked as spam':'Could not update',r.ok);
+      const next=String(b.dataset.spamState)!=='1';
+      const r=await api('/admin/application/'+b.dataset.spam,{spam:next});
+      if(r.ok){
+        b.dataset.spamState=next?'1':'0';
+        b.textContent=next?'Not spam':'Mark spam';
+        const row=b.closest('tr'); if(row) row.classList.toggle('spam',next);
+      }
+      toast(r.ok?(next?'Marked as spam':'No longer marked as spam'):'Could not update',r.ok);
     }));
     $$('[data-del]').forEach(b=>b.addEventListener('click',async()=>{
       if(!confirm('Delete this lead permanently?')) return;
@@ -338,13 +362,18 @@ export function dashboardPage(data, csrf) {
       if(r.ok){b.closest('.drawer').remove();toast('Deleted',true);}else toast('Could not delete',false);
     }));
     $$('[data-rmadmin]').forEach(b=>b.addEventListener('click',async()=>{
-      if(!confirm('Remove this admin user?')) return;
+      if(!confirm('Remove this admin user?'))return;
       const r=await api('/admin/admins/'+b.dataset.rmadmin,null,'DELETE');
-      toast(r.ok?'Removed':'Could not remove',r.ok);
+      if(r.ok){ const li=b.closest('li'); if(li) li.remove(); toast('Removed',true); }
+      else toast(r.error||'Could not remove',false);
     }));
     /* open rows */
     $$('[data-open]').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();document.querySelector('#d-'+b.dataset.open).classList.toggle('open');}));
-    $$('tr.row').forEach(tr=>tr.addEventListener('click',()=>{const d=document.querySelector('#d-'+tr.dataset.id);if(d)d.classList.toggle('open');}));
+    $$('tr.row').forEach(tr=>tr.addEventListener('click',(ev)=>{
+      if(ev.target && ev.target.closest('.pick')) return;
+      const d=document.querySelector('#d-'+tr.dataset.id);
+      if(d) d.classList.toggle('open');
+    }));
     /* filters */
     let stageF='all', srcF='', fromF='', toF='';
     function applyFilter(){
@@ -353,14 +382,27 @@ export function dashboardPage(data, csrf) {
         const okStage=stageF==='all'||tr.dataset.stage===stageF||(stageF==='hot'&&tr.querySelector('.score.hot'));
         const okSrc=!srcF||tr.dataset.source===srcF;
         const okQ=!q||(tr.dataset.search||'').includes(q);
-        let okDate=true;
-        const when=tr.children[1]?tr.children[1].textContent:'';
-        tr.style.display=okStage&&okSrc&&okQ&&okDate?'':'none';
+        const rowDate=tr.dataset.date||'';
+        const okFrom=!fromF||(!!rowDate&&rowDate>=fromF);
+        const okTo=!toF||(!!rowDate&&rowDate<=toF);
+        tr.style.display=okStage&&okSrc&&okQ&&okFrom&&okTo?'':'none';
       });
     }
     $$('#chips .chip').forEach(c=>c.addEventListener('click',()=>{$$('#chips .chip').forEach(x=>x.classList.remove('on'));c.classList.add('on');stageF=c.dataset.filter;applyFilter();}));
+    /* the pipeline bars are buttons too - they filter the same list */
+    $$('.pipe').forEach(p=>p.addEventListener('click',()=>{
+      $$('#chips .chip').forEach(x=>x.classList.remove('on'));
+      const chip=document.querySelector('#chips .chip[data-filter="'+p.dataset.stage+'"]');
+      if(chip) chip.classList.add('on');
+      stageF=p.dataset.stage;
+      applyFilter();
+      const body=document.querySelector('#tbody');
+      if(body) body.scrollIntoView({block:'start',behavior:'smooth'});
+    }));
     $('#q').addEventListener('input',applyFilter);
     $('#srcFilter').addEventListener('change',e=>{srcF=e.target.value;applyFilter();});
+    $('#from').addEventListener('change',e=>{fromF=e.target.value;applyFilter();});
+    $('#to').addEventListener('change',e=>{toF=e.target.value;applyFilter();});
     /* bulk */
     $$('.pick').forEach(c=>c.addEventListener('change',()=>{
       const n=$$('.pick:checked').length; $('#bulk').hidden=n===0; $('#bulkCount').textContent=n+' selected';
