@@ -452,7 +452,7 @@ export function dashboardPage(data, csrf) {
     $('#bulkClear').addEventListener('click',()=>{$$('.pick').forEach(c=>c.checked=false);$('#bulk').hidden=true;$('#bulkCount').textContent='0 selected';});
     /* copy */
     $('#saveContent').addEventListener('click',async()=>{
-      const r=await api('/admin/content',{headline:$('#c-headline').value,subheadline:$('#c-subheadline').value,cta_label:$('#c-cta_label').value,specialties:$('#c-specialties').value});
+      const r=await api('/admin/content',{headline:$('#c-headline').value,subheadline:$('#c-subheadline').value,cta_label:$('#c-cta_label').value,specialties:$('#c-specialties').value,cost_answer:$('#c-cost_answer')?$('#c-cost_answer').value:''});
       toast(r.ok?'Copy saved - refresh the funnel to see it':'Could not save copy',r.ok);
     });
     $('#saveSettings').addEventListener('click',async()=>{
