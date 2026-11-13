@@ -124,6 +124,8 @@ export function dashboardPage(data, csrf) {
         <button class="btn sm ghost" data-spam="${esc(r.id)}" data-spam-state="${r.spam ? 1 : 0}">${r.spam ? 'Not spam' : 'Mark spam'}</button>
         <button class="btn sm ghost" data-del="${esc(r.id)}">Delete</button>
         <a class="btn sm ghost" href="mailto:${esc(r.email)}?subject=${encodeURIComponent('Skip to 7 Figures')}">Email</a>
+          <a class="btn sm gold" href="https://wa.me/${esc((r.phone||'').replace(/\D/g,''))}?text=${encodeURIComponent('Hi '+esc(r.name||'')+', thanks for your Skip to 7 Figures application. ')}" target="_blank" rel="noopener">WhatsApp</a>
+          <button class="btn sm ghost" data-copy="${esc(r.id)}">Copy details</button>
       </div>
     </div>`;
     })
@@ -224,6 +226,7 @@ export function dashboardPage(data, csrf) {
           ${stages.map((x) => `<button class="btn sm ghost" data-bulk="${x}">Mark ${esc(STAGE_LABELS[x])}</button>`).join('')}
           <button class="btn sm ghost" id="bulkClear">Clear</button>
         </div>
+        ${(data.totalRows||rows.length) > rows.length ? `<p class="hint" style="margin:0 0 12px">Showing the ${rows.length} most recent of ${data.totalRows}. <a href="/admin/dashboard?limit=200">Show 200</a> · <a href="/admin/dashboard?limit=500">Show all</a></p>` : ''}
         ${rows.length ? `<table><thead><tr>
           <th style="width:28px"></th><th class="hide">When</th><th>Applicant</th><th>Score</th><th class="hide">Capital</th><th>Stage</th><th class="hide">Source</th><th></th>
         </tr></thead><tbody id="tbody">${tableRows}</tbody></table>` : `<div class="empty"><b>No applications yet</b>When someone completes the form on the funnel it will land here.</div>`}
@@ -360,6 +363,38 @@ export function dashboardPage(data, csrf) {
       if(!confirm('Delete this lead permanently?')) return;
       const r=await api('/admin/application/'+b.dataset.del,null,'DELETE');
       if(r.ok){b.closest('.drawer').remove();toast('Deleted',true);}else toast('Could not delete',false);
+    }));
+    $$('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{
+      const id=b.dataset.copy;
+      const row=document.querySelector('#tbody tr[data-id="'+id+'"]');
+      const drawer=document.querySelector('#d-'+id);
+      const txt=(drawer?drawer.innerText:'')+'\\n\\n'+(row?row.innerText:'');
+      toast('Copying...',true);
+      try{
+        if(!navigator.clipboard||!navigator.clipboard.writeText) throw new Error('no clipboard api');
+        /* the clipboard promise can hang forever when permission is refused -
+           race it against a timeout so the button always answers */
+        await Promise.race([
+          navigator.clipboard.writeText(txt),
+          new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),1500))
+        ]);
+        toast('Details copied',true);
+      }catch(e){
+        /* fallback: select the text and use the old copy command */
+        try{
+          const ta=document.createElement('textarea');
+          ta.value=txt;
+          ta.setAttribute('readonly','');
+          ta.style.position='fixed';
+          ta.style.opacity='0';
+          document.body.appendChild(ta);
+          ta.select();
+          ta.setSelectionRange(0,ta.value.length);
+          const ok=document.execCommand('copy');
+          document.body.removeChild(ta);
+          toast(ok?'Details copied':'Could not copy',ok);
+        }catch(err){ toast('Could not copy - the details are on screen',false); }
+      }
     }));
     $$('[data-rmadmin]').forEach(b=>b.addEventListener('click',async()=>{
       if(!confirm('Remove this admin user?'))return;

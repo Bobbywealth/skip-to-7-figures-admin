@@ -33,6 +33,9 @@ jobs:
       - name: Every INSERT must have one value per column
         run: node scripts/check-sql.mjs src/index.js
 
+      - name: The GENERATED dashboard script must parse
+        run: node scripts/check-dashboard-script.mjs
+
       - name: The schema and the migrations must not disagree on table names
         run: |
           set -e

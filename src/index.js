@@ -397,7 +397,7 @@ async function notifyLead(env, ctx, lead) {
         ).bind('telegram', now).run();
       }
       const lines = [
-        'New Skip to 7 Figures application',
+        lead.unverified ? 'New Skip to 7 Figures application (no bot check - please verify)' : 'New Skip to 7 Figures application',
         '',
         lead.name ? `Name: ${lead.name}` : null,
         lead.email ? `Email: ${lead.email}` : null,
@@ -531,8 +531,9 @@ async function handleApply(request, env, ctx) {
 
   await logActivity(env, 'visitor', 'applied', leadId, `score ${score} (${scoreBand(score)})${flagged ? ' [no bot check]' : ''}`);
   await recordEvent(env, 'apply_complete', '/', visitorId, { score });
-  /* only a lead that passed the bot check pings Bobby's phone */
-  if (!flagged) await notifyLead(env, ctx, lead);
+  /* EVERY lead pings Bobby - a flagged one is marked so he knows it skipped the
+     bot check, but a real applicant is never silently hidden from him */
+  await notifyLead(env, ctx, { ...lead, unverified: flagged });
   if (ctx && ctx.waitUntil) {
     ctx.waitUntil(deliverWebhooks(env, 'lead.created', lead));
   } else {
@@ -634,16 +635,26 @@ async function buildDigest(env) {
      FROM applications`
   ).first();
   const v = await env.DB.prepare(`SELECT COALESCE(SUM(count),0) AS t FROM visits WHERE day >= date('now','-1 day')`).first();
+  const ev = await env.DB.prepare(
+    `SELECT COALESCE(SUM(CASE WHEN name='apply_start' THEN 1 ELSE 0 END),0) AS starts,
+            COALESCE(SUM(CASE WHEN name='apply_complete' THEN 1 ELSE 0 END),0) AS completes FROM events`
+  ).first();
+  const views = (v && v.t) || 0;
+  const starts = (ev && ev.starts) || 0;
+  const completes = (ev && ev.completes) || 0;
+  const conv = views > 0 ? ((completes / views) * 100).toFixed(1) + '%' : 'n/a';
   const text = [
     'Skip to 7 Figures - daily summary',
     `Applications today: ${(s && s.today) || 0} (total ${(s && s.total) || 0})`,
     `Still to contact: ${(s && s.newLeads) || 0}`,
-    `Page views (24h): ${(v && v.t) || 0}`,
+    `Page views (24h): ${views}`,
+    `Started the form: ${starts} · completed: ${completes}`,
+    `View to application: ${conv}`,
   ].join('\n');
   return { text, total: (s && s.total) || 0, newLeads: (s && s.newLeads) || 0, today: (s && s.today) || 0 };
 }
 
-async function dashboardData(env) {
+async function dashboardData(env, listLimit) {
   const stats = await env.DB.prepare(
     `SELECT
        COUNT(*) AS total,
@@ -668,8 +679,8 @@ async function dashboardData(env) {
              WHEN referrer LIKE '%tiktok%' THEN 'tiktok'
              WHEN referrer LIKE '%google%' THEN 'google'
              WHEN referrer != '' THEN 'other' ELSE 'direct' END) AS source_label
-     FROM applications ORDER BY id DESC LIMIT 500`
-  ).all();
+     FROM applications ORDER BY id DESC LIMIT ?`
+  ).bind(listLimit).all();
   const content = await env.DB.prepare('SELECT key, value FROM content').all();
   const daily = await env.DB.prepare(
     `SELECT d.day,
@@ -713,11 +724,14 @@ async function dashboardData(env) {
     admins: admins.results || [],
     settings,
     reminders: reminders.results || [],
+    listed: list.results ? list.results.length : 0,
+    totalRows: (stats && stats.total) || 0,
   };
 }
 
 async function handleDashboard(request, env, session) {
-  const data = await dashboardData(env);
+  const requested = parseInt(new URL(request.url).searchParams.get('limit') || '100', 10);
+  const data = await dashboardData(env, Math.min(500, Math.max(25, Number.isFinite(requested) ? requested : 100)));
   return html(shell('Dashboard · Skip to 7 Figures Admin', dashboardPage(data, session.csrf)));
 }
 
@@ -1027,6 +1041,8 @@ async function handleRequest(request, env, ctx) {
 
       /* ---- service status / health ---- */
       if (path === '/api/status' && method === 'GET') {
+        const s = await readSession(env.SESSION_SECRET, request, env);
+        if (!s) return json({ ok: false, error: 'Not signed in.' }, 401);
         const db = await env.DB.prepare('SELECT COUNT(*) AS c FROM applications').first();
         const err = await env.DB.prepare('SELECT created_at, message FROM errors ORDER BY id DESC LIMIT 1').first();
         const last = await env.DB.prepare('SELECT created_at FROM activity ORDER BY id DESC LIMIT 1').first();
@@ -1319,6 +1335,8 @@ await logActivity(env, session.sub, 'password_changed', null, '');
 
       /* ---- public funnel counters for the site ---- */
       if (path === '/api/stats' && method === 'GET') {
+        const s = await readSession(env.SESSION_SECRET, request, env);
+        if (!s) return json({ ok: false, error: 'Not signed in.' }, 401);
         const v = await env.DB.prepare('SELECT COALESCE(SUM(count),0) AS total FROM visits').first();
         const e = await env.DB.prepare("SELECT COUNT(*) AS c FROM events WHERE name = 'apply_start'").first();
         const c = await env.DB.prepare("SELECT COUNT(*) AS c FROM events WHERE name = 'apply_complete'").first();
