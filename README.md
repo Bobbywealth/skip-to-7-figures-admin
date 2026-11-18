@@ -27,4 +27,4 @@ npx wrangler deploy
 
 - PBKDF2 iterations are capped at **100,000** (Cloudflare Workers limit).
 - The D1 database is `skip7figures` (id `5f8e95c9-d790-4ee2-9b28-ed6f56c861af`), region ENAM.
-- Admin email: `business@wolfpaqmarketing.com` - only the PBKDF2 hash + salt is stored in D1.
+- Admin email: `keenanjordan31@gmail.com` (changed from `business@wolfpaqmarketing.com` on 2026-11-18) - only the PBKDF2 hash + salt is stored in D1.

@@ -17,7 +17,7 @@ This is the operating document for the Skip to 7 Figures funnel and its admin. I
 
 **Both live hosts are on Cloudflare**, so the declined Render card cannot take either of them down.
 
-**Admin login:** `business@wolfpaqmarketing.com`. The password is stored only as a PBKDF2-SHA256 hash (100,000 iterations, per-admin salt) in D1 — it is never in the repo. It was printed once in chat on 2026-11-12 and saved to a mode-600 artifact; **treat it as exposed and rotate it** (the dashboard has a "Change password" panel, which also revokes every other session).
+**Admin login:** `keenanjordan31@gmail.com` (changed from `business@wolfpaqmarketing.com` on 2026-11-18 by renaming the row in D1 — the password was left untouched). The password is stored only as a PBKDF2-SHA256 hash (100,000 iterations, per-admin salt) in D1 — it is never in the repo. It was printed once in chat on 2026-11-12 and saved to a mode-600 artifact; **treat it as exposed and rotate it** (the dashboard has a "Change password" panel, which also revokes every other session).
 
 ---
 
