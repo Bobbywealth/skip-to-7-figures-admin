@@ -847,6 +847,64 @@ async function dashboardData(env, listLimit) {
        AND (last_contacted_at IS NULL OR last_contacted_at < datetime('now','-3 days'))
      ORDER BY score DESC LIMIT 10`
   ).all();
+
+  /* ---- the v3 console reads these ---- */
+  const quality = await env.DB.prepare(
+    `SELECT COALESCE(NULLIF(utm_source,''), CASE WHEN referrer LIKE '%instagram%' THEN 'instagram' WHEN referrer LIKE '%facebook%' THEN 'facebook' WHEN referrer LIKE '%tiktok%' THEN 'tiktok' WHEN referrer LIKE '%google%' THEN 'google' WHEN referrer != '' THEN 'other' ELSE 'direct' END) AS src,
+            COUNT(*) AS n,
+            COALESCE(SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END),0) AS hot,
+            COALESCE(SUM(CASE WHEN stage IN ('qualified','closed') THEN 1 ELSE 0 END),0) AS qualified
+     FROM applications GROUP BY src ORDER BY qualified DESC, hot DESC, n DESC LIMIT 12`
+  ).all();
+  const bands = await env.DB.prepare(
+    `SELECT COALESCE(SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END),0) AS hot,
+            COALESCE(SUM(CASE WHEN score >= 45 AND score < 70 THEN 1 ELSE 0 END),0) AS warm,
+            COALESCE(SUM(CASE WHEN score < 45 THEN 1 ELSE 0 END),0) AS cool,
+            COALESCE(SUM(CASE WHEN stage IN ('new','contacted') AND last_contacted_at IS NULL THEN 1 ELSE 0 END),0) AS untouched
+     FROM applications`
+  ).first();
+  const response = await env.DB.prepare(
+    `SELECT ROUND(AVG((julianday(last_contacted_at) - julianday(created_at)) * 24), 1) AS avg_hours,
+            COUNT(*) AS contacted
+     FROM applications WHERE last_contacted_at IS NOT NULL`
+  ).first();
+  const oldestUncontacted = await env.DB.prepare(
+    `SELECT id,name,email,score,created_at FROM applications
+     WHERE stage IN ('new','contacted') AND last_contacted_at IS NULL
+     ORDER BY created_at ASC LIMIT 1`
+  ).first();
+  const duplicates = await env.DB.prepare(
+    `SELECT a.id, a.name, a.email, a.created_at, a.duplicate_of, b.name AS orig_name, b.email AS orig_email
+     FROM applications a JOIN applications b ON b.id = a.duplicate_of
+     ORDER BY a.created_at DESC LIMIT 20`
+  ).all();
+  const due = await env.DB.prepare(
+    `SELECT id,name,email,score,stage,next_action_at FROM applications
+     WHERE next_action_at IS NOT NULL AND next_action_at <= datetime('now')
+       AND stage NOT IN ('closed','lost')
+     ORDER BY next_action_at ASC LIMIT 20`
+  ).all();
+  const upcoming = await env.DB.prepare(
+    `SELECT id,name,email,score,stage,next_action_at FROM applications
+     WHERE next_action_at IS NOT NULL AND next_action_at > datetime('now')
+       AND stage NOT IN ('closed','lost')
+     ORDER BY next_action_at ASC LIMIT 20`
+  ).all();
+  const tagRows = await env.DB.prepare(
+    `SELECT tags FROM applications WHERE tags IS NOT NULL AND tags != ''`
+  ).all();
+  const tagCount = new Map();
+  for (const t of tagRows.results || []) {
+    String(t.tags || '')
+      .split(',')
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .forEach((tag) => tagCount.set(tag, (tagCount.get(tag) || 0) + 1));
+  }
+  const tags = Array.from(tagCount.entries())
+    .map(([tag, n]) => ({ tag, n }))
+    .sort((a, b) => b.n - a.n || a.tag.localeCompare(b.tag))
+    .slice(0, 24);
   return {
     stats: stats || {},
     views: views || {},
@@ -860,6 +918,14 @@ async function dashboardData(env, listLimit) {
     admins: admins.results || [],
     settings,
     reminders: reminders.results || [],
+    quality: quality.results || [],
+    bands: bands || { hot: 0, warm: 0, cool: 0, untouched: 0 },
+    response: response || { avg_hours: null, contacted: 0 },
+    oldestUncontacted: oldestUncontacted || null,
+    duplicates: duplicates.results || [],
+    due: due.results || [],
+    upcoming: upcoming.results || [],
+    tags,
     listed: list.results ? list.results.length : 0,
     totalRows: (stats && stats.total) || 0,
   };
@@ -914,6 +980,25 @@ async function handleUpdateApplication(request, env, session, id) {
     sets.push('notes = ?', "notes_updated_at = datetime('now')", 'notes_author = ?');
     binds.push(clean(body.notes, 2000), String(session.sub || '').slice(0, 120));
     changes.push('notes edited');
+  }
+  /* follow-up reminder: an ISO-ish date, or an empty string to clear it */
+  if (typeof body.next_action_at === 'string') {
+    const v = clean(body.next_action_at, 40);
+    sets.push('next_action_at = ?');
+    binds.push(v || null);
+    changes.push(v ? 'follow-up ' + v : 'follow-up cleared');
+  }
+  /* tags: a comma-separated list, normalised and capped */
+  if (typeof body.tags === 'string') {
+    const v = body.tags
+      .split(',')
+      .map((t) => clean(t, 24).trim())
+      .filter(Boolean)
+      .slice(0, 12)
+      .join(',');
+    sets.push('tags = ?');
+    binds.push(v || null);
+    changes.push(v ? 'tags ' + v : 'tags cleared');
   }
   if (body.rescore === true) {
     const cur = await env.DB.prepare('SELECT capital,timeline,experience,interest,decision FROM applications WHERE id = ?').bind(id).first();

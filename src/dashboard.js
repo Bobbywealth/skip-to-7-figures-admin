@@ -27,6 +27,22 @@ const VIEWS = {
   settings: ['Settings', 'Retention, admins and security'],
 };
 
+const COLUMNS = [
+  ['when', 'When', true],
+  ['score', 'Score', true],
+  ['capital', 'Capital', false],
+  ['stage', 'Stage', true],
+  ['source', 'Source', false],
+  ['open', 'Open', true],
+];
+
+const TEMPLATES = {
+  intro: 'Hi {name}, thanks for your Skip to 7 Figures application. What are you hoping to build?',
+  followup: 'Hi {name}, just following up on your application. Happy to answer anything you need to know.',
+  price: 'Hi {name}, happy to send over the cost details. What email should I send them to?',
+  later: 'Hi {name}, no rush at all. I will check back in a couple of weeks. Anything I can help with?',
+};
+
 function esc(v) {
   return String(v == null ? '' : v).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -39,10 +55,15 @@ function num(v) {
   const n = Number(v || 0);
   return Number.isFinite(n) ? n : 0;
 }
+function ms(iso) {
+  if (!iso) return 0;
+  const t = Date.parse(String(iso).replace(' ', 'T') + 'Z');
+  return Number.isNaN(t) ? 0 : t;
+}
 function when(iso) {
   if (!iso) return '';
-  const t = Date.parse(String(iso).replace(' ', 'T') + 'Z');
-  if (Number.isNaN(t)) return String(iso);
+  const t = ms(iso);
+  if (!t) return String(iso);
   const diff = Date.now() - t;
   const m = Math.floor(diff / 60000);
   if (m < 1) return 'just now';
@@ -60,6 +81,31 @@ function initials(name, email) {
 }
 function waNumber(phone) {
   return String(phone || '').replace(/\D/g, '');
+}
+function tagList(r) {
+  return String(r.tags || '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+/* 0 = fine, 1 = a few hours old, 2 = over a day old */
+function slaOf(r) {
+  const st = r.stage || 'new';
+  if (st !== 'new' && st !== 'contacted') return 0;
+  if (r.last_contacted_at) return 0;
+  const t = ms(r.created_at);
+  if (!t) return 0;
+  const h = (Date.now() - t) / 3600000;
+  if (h >= 24) return 2;
+  if (h >= 3) return 1;
+  return 0;
+}
+function dateOnly(v) {
+  return String(v || '').slice(0, 10);
+}
+function plusDays(days) {
+  const d = new Date(Date.now() + days * 86400000);
+  return d.toISOString().slice(0, 10) + ' 09:00:00';
 }
 
 /* ---------- charts ---------- */
@@ -147,6 +193,18 @@ export function dashboardPage(data, csrf) {
   const total = num(s.total);
   const settings = data.settings || {};
   const content = data.content || {};
+  const bands = data.bands || { hot: 0, warm: 0, cool: 0, untouched: 0 };
+  const response = data.response || { avg_hours: null, contacted: 0 };
+
+  /* ---- health signals for the hero strip ---- */
+  const last7 = daily.slice(-7).reduce((a, d) => a + num(d.leads), 0);
+  const prev7 = daily.slice(-14, -7).reduce((a, d) => a + num(d.leads), 0);
+  const trendState = prev7 === 0 ? (last7 > 0 ? 'good' : 'flat') : (last7 >= prev7 ? 'good' : 'bad');
+  const avgH = response.avg_hours == null ? null : Number(response.avg_hours);
+  const respState = avgH == null ? 'flat' : avgH <= 12 ? 'good' : avgH <= 48 ? 'warn' : 'bad';
+  const backlogState = num(bands.untouched) > 10 ? 'bad' : num(bands.untouched) > 3 ? 'warn' : 'good';
+  const hotRate = total > 0 ? (num(bands.hot) / total) * 100 : 0;
+  const hotState = hotRate >= 20 ? 'good' : hotRate >= 8 ? 'warn' : 'flat';
 
   const plate = (n, label, tone) =>
     `<div class="plate${tone ? ' ' + tone : ''}"><b>${esc(n ?? 0)}</b><span>${esc(label)}</span></div>`;
@@ -177,23 +235,31 @@ export function dashboardPage(data, csrf) {
       const st = r.stage || 'new';
       const src = r.source_label || r.utm_source || 'direct';
       const sc = band(r.score);
+      const sla = slaOf(r);
+      const slaChip = sla === 2 ? '<span class="sla sla--2">24h+</span>' : sla === 1 ? '<span class="sla sla--1">3h+</span>' : '';
+      const tags = tagList(r);
+      const tagChips = tags.slice(0, 2).map((t) => `<span class="tag tag--tag">${esc(t)}</span>`).join('');
+      const created = ms(r.created_at);
+      const contacted = ms(r.last_contacted_at);
       return `<tr class="row${dup}${spam}" data-id="${esc(r.id)}" data-stage="${esc(st)}" data-source="${esc(String(src).toLowerCase())}"` +
         ` data-owner="${esc(String(r.owner || '').toLowerCase())}" data-date="${esc(String(r.created_at || '').slice(0, 10))}"` +
         ` data-name="${esc(r.name || '')}" data-email="${esc(r.email || '')}" data-phone="${esc(r.phone || '')}"` +
         ` data-capital="${esc(r.capital || '')}" data-timeline="${esc(r.timeline || '')}" data-experience="${esc(r.experience || '')}"` +
         ` data-interest="${esc(r.interest || '')}" data-decision="${esc(r.decision || '')}" data-owner-name="${esc(r.owner || '')}"` +
         ` data-source-label="${esc(src)}" data-score="${esc(r.score || 0)}" data-band="${esc(sc)}" data-when="${esc(when(r.created_at))}"` +
-        ` data-search="${esc([r.name, r.email, r.phone, r.capital, r.interest, r.utm_campaign, r.referrer, r.owner].join(' ').toLowerCase())}">` +
+        ` data-created="${created}" data-contacted="${contacted}" data-dup="${r.duplicate_of ? 1 : 0}" data-tags="${esc(tags.join(',').toLowerCase())}"` +
+        ` data-next="${esc(r.next_action_at || '')}" data-notes="${esc(r.notes || '')}"` +
+        ` data-search="${esc([r.name, r.email, r.phone, r.capital, r.interest, r.utm_campaign, r.referrer, r.owner, src, r.notes, tags.join(' ')].join(' ').toLowerCase())}">` +
         `<td><input type="checkbox" class="pick" data-id="${esc(r.id)}" aria-label="Select lead ${esc(r.id)}"></td>` +
-        `<td class="mono hide" style="white-space:nowrap;color:var(--muted)">${esc(when(r.created_at))}</td>` +
+        `<td class="mono hide" data-col="when" data-when-cell="${created}">${esc(when(r.created_at))}${slaChip}</td>` +
         `<td class="who"><span class="who__av ${sc}">${esc(initials(r.name, r.email))}</span><div>` +
-        `<b>${esc(r.name || '-')}${r.duplicate_of ? ' <span class="tag">dup</span>' : ''}${r.flagged ? ' <span class="tag tag--warn">unverified</span>' : ''}${r.spam ? ' <span class="tag tag--bad">spam</span>' : ''}</b>` +
+        `<b>${esc(r.name || '-')}${tagChips}${r.duplicate_of ? ' <span class="tag">dup</span>' : ''}${r.flagged ? ' <span class="tag tag--warn">unverified</span>' : ''}${r.spam ? ' <span class="tag tag--bad">spam</span>' : ''}</b>` +
         `<a href="mailto:${esc(r.email)}">${esc(r.email)}</a></div></td>` +
-        `<td class="col-score"><span class="score ${sc}">${esc(r.score || 0)}</span></td>` +
-        `<td class="hide">${esc(r.capital)}</td>` +
-        `<td class="pill-cell"><span class="pill ${esc(st)}">${esc(STAGE_LABELS[st] || st)}</span></td>` +
-        `<td class="hide">${esc(src)}</td>` +
-        `<td class="col-open"><button class="btn sm ghost" data-open="${esc(r.id)}">Open</button></td></tr>`;
+        `<td data-col="score"><span class="score ${sc}">${esc(r.score || 0)}</span></td>` +
+        `<td class="hide" data-col="capital">${esc(r.capital)}</td>` +
+        `<td class="pill-cell" data-col="stage"><span class="pill ${esc(st)}">${esc(STAGE_LABELS[st] || st)}</span></td>` +
+        `<td class="hide" data-col="source">${esc(src)}</td>` +
+        `<td data-col="open"><button class="btn sm ghost" data-open="${esc(r.id)}">Open</button></td></tr>`;
     })
     .join('');
 
@@ -201,20 +267,59 @@ export function dashboardPage(data, csrf) {
     .map((r) => {
       const st = r.stage || 'new';
       const phone = waNumber(r.phone);
+      const tags = tagList(r);
+      const sla = slaOf(r);
+      const next = r.next_action_at || '';
       return `<div class="drawer" id="d-${esc(r.id)}">
       <div class="drawer__head">
-        <div><h3>${esc(r.name || 'Applicant')} <span class="score ${band(r.score)}">${esc(r.score || 0)}</span></h3>
+        <div><h3>${esc(r.name || 'Applicant')} <span class="score ${band(r.score)}">${esc(r.score || 0)}</span>${sla === 2 ? '<span class="sla sla--2">24h+</span>' : sla === 1 ? '<span class="sla sla--1">3h+</span>' : ''}</h3>
         <p class="muted" style="margin:4px 0 0;font-size:.82rem">${esc(when(r.created_at))} · ${esc(r.source_label || r.source || 'funnel')} · ${esc(r.device || '')} ${esc(r.country || '')}</p></div>
         <div style="display:flex;align-items:center;gap:8px">
           <span class="pill ${esc(st)}">${esc(STAGE_LABELS[st] || st)}</span>
           <button class="drawer__x" data-close="${esc(r.id)}" aria-label="Close lead">×</button>
         </div>
       </div>
-      <div class="rowact" style="margin:0 0 16px">
+      <div class="rowact" style="margin:0 0 14px">
         <a class="btn sm gold" href="mailto:${esc(r.email)}?subject=${encodeURIComponent('Skip to 7 Figures')}">Email</a>
         <a class="btn sm ghost" href="tel:${esc(r.phone)}">Call</a>
-        <a class="btn sm ghost" href="https://wa.me/${esc(phone)}?text=${encodeURIComponent('Hi ' + (r.name || '') + ', thanks for your Skip to 7 Figures application. ')}" target="_blank" rel="noopener">WhatsApp</a>
+        <a class="btn sm ghost" data-wa="${esc(r.id)}" href="https://wa.me/${esc(phone)}" target="_blank" rel="noopener">WhatsApp</a>
         <button class="btn sm ghost" data-copy="${esc(r.id)}">Copy details</button>
+        <button class="btn sm ghost" data-print="${esc(r.id)}">Print</button>
+      </div>
+      <div class="tpl">
+        <label>Message template</label>
+        <div class="rowact" style="margin-top:0">
+          <select class="tpl__sel" data-tpl="${esc(r.id)}">
+            <option value="">Choose a template...</option>
+            <option value="intro">Intro</option>
+            <option value="followup">Follow up</option>
+            <option value="price">Price question</option>
+            <option value="later">Not now</option>
+          </select>
+          <button class="btn sm ghost" data-tplcopy="${esc(r.id)}">Copy message</button>
+        </div>
+        <p class="tpl__out" data-tplout="${esc(r.id)}" hidden></p>
+      </div>
+      <div class="remind">
+        <label>Follow up</label>
+        <div class="rowact" style="margin-top:0">
+          <button class="btn sm ghost" data-remind="${esc(r.id)}" data-days="1">Tomorrow</button>
+          <button class="btn sm ghost" data-remind="${esc(r.id)}" data-days="3">In 3 days</button>
+          <button class="btn sm ghost" data-remind="${esc(r.id)}" data-days="7">Next week</button>
+          <input class="rmdate" type="date" data-rmdate="${esc(r.id)}" value="${esc(dateOnly(next))}">
+          ${next ? `<button class="btn sm ghost" data-remindclear="${esc(r.id)}">Clear</button>` : ''}
+        </div>
+        <p class="muted remind__msg" data-rmmsg="${esc(r.id)}">${next ? 'Follow-up set for ' + esc(String(next).slice(0, 10)) : 'No follow-up set'}</p>
+      </div>
+      <div class="tagbox">
+        <label>Tags</label>
+        <div class="rowact" style="margin-top:0">
+          <input class="edit" data-field="tags" data-id="${esc(r.id)}" value="${esc(tags.join(', '))}" placeholder="vip, booked">
+          <button class="btn sm ghost" data-tagsave="${esc(r.id)}">Save tags</button>
+        </div>
+        <div class="chips" style="margin-top:8px">
+          ${['VIP', 'Booked', 'Applied', 'Ghost'].map((t) => `<button class="chip chip--mini" data-addtag="${esc(r.id)}" data-tag="${esc(t)}">+ ${esc(t)}</button>`).join('')}
+        </div>
       </div>
       <dl class="kv">
         <dt>Email</dt><dd><a href="mailto:${esc(r.email)}">${esc(r.email)}</a></dd>
@@ -249,15 +354,34 @@ export function dashboardPage(data, csrf) {
     .map((r) => `<li><b>${esc(r.name || r.email)}</b> <span class="muted">score ${esc(r.score)} · ${esc(STAGE_LABELS[r.stage] || r.stage)} · ${esc(when(r.last_contacted_at || r.created_at))}</span> <button class="btn sm ghost" data-jump="${esc(r.id)}">Open</button></li>`)
     .join('') || '<li class="muted">Nothing waiting. You are caught up.</li>';
 
-  const srcMax = Math.max(1, ...(data.sources || []).map((x) => num(x.n)));
-  const sources = (data.sources || [])
-    .map((x) => `<div class="srcrow"><span>${esc(x.src || 'direct')}</span>` +
-      `<span class="srcrow__t"><i style="width:${Math.max(3, Math.round((num(x.n) / srcMax) * 100))}%"></i></span>` +
-      `<span class="srcrow__n">${esc(x.n)}</span></div>`)
-    .join('') || '<p class="muted" style="font-size:.85rem">No traffic data yet.</p>';
+  const dueList = (data.due || [])
+    .map((r) => `<li><b>${esc(r.name || r.email)}</b> <span class="muted">due ${esc(String(r.next_action_at || '').slice(0, 10))} · score ${esc(r.score)}</span> <button class="btn sm ghost" data-jump="${esc(r.id)}">Open</button></li>`)
+    .join('');
+  const upList = (data.upcoming || [])
+    .map((r) => `<li><b>${esc(r.name || r.email)}</b> <span class="muted">${esc(String(r.next_action_at || '').slice(0, 10))} · score ${esc(r.score)}</span> <button class="btn sm ghost" data-jump="${esc(r.id)}">Open</button></li>`)
+    .join('');
+
+  const dupList = (data.duplicates || [])
+    .map((d) => `<li><b>${esc(d.name || d.email)}</b> <span class="muted">duplicate of ${esc(d.orig_name || d.orig_email)} · ${esc(when(d.created_at))}</span> <button class="btn sm ghost" data-jump="${esc(d.id)}">Open</button></li>`)
+    .join('');
+
+  const qMax = Math.max(1, ...(data.quality || []).map((x) => num(x.n)));
+  const quality = (data.quality || [])
+    .map((x) => `<tr><td>${esc(x.src || 'direct')}</td>` +
+      `<td class="qbar"><span class="qbar__t"><i style="width:${Math.max(3, Math.round((num(x.n) / qMax) * 100))}%"></i></span>${esc(x.n)}</td>` +
+      `<td>${esc(x.hot)}</td><td>${esc(x.qualified)}</td></tr>`)
+    .join('');
+
+  const bandTotal = Math.max(1, num(bands.hot) + num(bands.warm) + num(bands.cool));
+  const bandRow = (label, n, color) => `<div class="mixrow"><span>${esc(label)}</span>` +
+    `<span class="mixrow__t"><i style="width:${Math.max(2, Math.round((num(n) / bandTotal) * 100))}%;background:${color}"></i></span>` +
+    `<span class="mixrow__n">${esc(n)}</span></div>`;
 
   const activity = (data.activity || [])
-    .map((a) => `<li><b>${esc(a.actor || 'system')}</b> ${esc(a.action)} ${a.entity_id ? '#' + esc(a.entity_id) : ''} <span class="muted">${esc(when(a.created_at))}${a.detail ? ' · ' + esc(a.detail) : ''}</span></li>`)
+    .map((a) => {
+      const kind = /applied|created/i.test(a.action || '') ? 'lead' : /login/i.test(a.action || '') ? 'admin' : 'system';
+      return `<li data-act="${esc(kind)}"><b>${esc(a.actor || 'system')}</b> ${esc(a.action)} ${a.entity_id ? '#' + esc(a.entity_id) : ''} <span class="muted">${esc(when(a.created_at))}${a.detail ? ' · ' + esc(a.detail) : ''}</span></li>`;
+    })
     .join('') || '<li class="muted">No activity yet.</li>';
 
   const errors = (data.errors || [])
@@ -267,6 +391,17 @@ export function dashboardPage(data, csrf) {
   const admins = (data.admins || [])
     .map((a) => `<li><b>${esc(a.email)}</b> <span class="muted">last ${esc(a.last_login_at ? when(a.last_login_at) : 'never')}</span> <button class="btn sm ghost" data-rmadmin="${esc(a.id)}">Remove</button></li>`)
     .join('');
+
+  const tagChips = (data.tags || [])
+    .map((t) => `<button class="chip" data-filter="tag:${esc(t.tag)}">${esc(t.tag)} <span class="chip__n">${esc(t.n)}</span></button>`)
+    .join('');
+
+  const health = [
+    { k: 'Applications', v: last7 + ' this week', s: trendState, d: prev7 ? 'vs ' + prev7 + ' last week' : '' },
+    { k: 'Response time', v: avgH == null ? 'no data' : avgH + 'h avg', s: respState, d: response.contacted ? response.contacted + ' contacted' : '' },
+    { k: 'Uncontacted', v: num(bands.untouched), s: backlogState, d: 'waiting on you' },
+    { k: 'Hot rate', v: hotRate.toFixed(0) + '%', s: hotState, d: num(bands.hot) + ' hot leads' },
+  ];
 
   return `<style>${DASH_CSS}</style>
 <div class="app" id="app">
@@ -288,6 +423,8 @@ export function dashboardPage(data, csrf) {
     <div class="rail__foot">
       <div class="rail__who"><span class="avatar">${esc(initials('Admin', ''))}</span><div><b>Administrator</b><span>${esc((data.admins && data.admins[0] && data.admins[0].email) || '')}</span></div></div>
       <a class="rail__link" href="https://skip-to-7-figures.skip7figures.workers.dev/" target="_blank" rel="noopener">View live site ↗</a>
+      <button class="rail__link" id="themeBtn">Dark mode</button>
+      <button class="rail__link" id="keysBtn">Keyboard shortcuts</button>
       <form method="post" action="/admin/logout" id="logoutForm"><button class="rail__link" type="submit">Sign out</button></form>
     </div>
   </aside>
@@ -297,6 +434,8 @@ export function dashboardPage(data, csrf) {
       <button class="bar__burger" id="burger" aria-label="Open menu">☰</button>
       <div class="bar__title"><h1 id="viewTitle">Overview</h1><p id="viewSub">Live pulse of the funnel</p></div>
       <div class="bar__actions">
+        <span class="newpill" id="newPill" hidden><b></b><button type="button" id="newReload">Reload</button></span>
+        <button class="live" id="liveBtn" aria-pressed="false"><span class="live__dot"></span>Live</button>
         <button class="omni" id="omniBtn"><span>Search leads</span><kbd>⌘K</kbd></button>
         <a class="bar__link" href="/admin/export.csv">Export CSV</a>
       </div>
@@ -319,6 +458,9 @@ export function dashboardPage(data, csrf) {
               <div><b>${esc(num(s.qualified))}</b><span>Qualified</span></div>
             </div>
             <div class="hero__spark">${sparkSvg(daily)}</div>
+          </div>
+          <div class="health">
+            ${health.map((h) => `<div class="health__i health--${h.s}"><span class="health__dot"></span><div><b>${esc(h.v)}</b><span>${esc(h.k)}</span>${h.d ? `<em>${esc(h.d)}</em>` : ''}</div></div>`).join('')}
           </div>
         </div>
 
@@ -376,11 +518,39 @@ export function dashboardPage(data, csrf) {
           </section>
           <section class="panel">
             <div class="panel__head">
-              <div><h2>Where they came from</h2><p>UTM source, then referrer, then direct.</p></div>
+              <div><h2>Follow-ups</h2><p>Reminders you set, overdue and coming up.</p></div>
             </div>
-            ${sources}
+            <ul class="mini">${dueList || '<li class="muted">Nothing due.</li>'}</ul>
+            ${upList ? `<p class="panel__sub">Coming up</p><ul class="mini">${upList}</ul>` : ''}
           </section>
         </div>
+
+        <div class="grid-2">
+          <section class="panel">
+            <div class="panel__head">
+              <div><h2>Source quality</h2><p>Which traffic turns into hot and qualified leads.</p></div>
+            </div>
+            ${quality ? `<table class="qtable"><thead><tr><th>Source</th><th>Leads</th><th>Hot</th><th>Qualified</th></tr></thead><tbody>${quality}</tbody></table>` : '<p class="muted" style="font-size:.85rem">No traffic data yet.</p>'}
+          </section>
+          <section class="panel">
+            <div class="panel__head">
+              <div><h2>Lead quality mix</h2><p>Scored hot, warm and cool.</p></div>
+            </div>
+            <div class="mix">
+              ${bandRow('Hot', bands.hot, 'linear-gradient(90deg,#F0B27A,#C9702F)')}
+              ${bandRow('Warm', bands.warm, 'linear-gradient(90deg,#E3C48A,#B98C42)')}
+              ${bandRow('Cool', bands.cool, 'linear-gradient(90deg,#C9C3B6,#8E877A)')}
+            </div>
+            <p class="muted" style="margin:14px 0 0;font-size:.84rem">${esc(num(bands.untouched))} never contacted</p>
+          </section>
+        </div>
+
+        ${(data.duplicates || []).length ? `<section class="panel">
+          <div class="panel__head">
+            <div><h2>Duplicate applications</h2><p>The same person applied more than once.</p></div>
+          </div>
+          <ul class="mini">${dupList}</ul>
+        </section>` : ''}
       </section>
 
       <!-- ============ LEADS ============ -->
@@ -392,20 +562,37 @@ export function dashboardPage(data, csrf) {
                 <button class="chip on" data-filter="all">All</button>
                 ${stages.map((x) => `<button class="chip" data-filter="${x}">${esc(STAGE_LABELS[x])}</button>`).join('')}
                 <button class="chip" data-filter="hot">Hot</button>
+                <button class="chip" data-filter="dup">Duplicates</button>
               </div>
+              ${tagChips ? `<div class="chips chips--tags" id="tagChips">${tagChips}</div>` : ''}
               <input class="search" id="q" type="search" placeholder="Search leads...">
               <select id="srcFilter" class="search"><option value="">All sources</option>${(data.sources || []).map((x) => `<option value="${esc(String(x.src || 'direct').toLowerCase())}">${esc(x.src || 'direct')}</option>`).join('')}</select>
+              <select id="sortSel" class="search" title="Sort">
+                <option value="new">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="score">Highest score</option>
+                <option value="scoreLow">Lowest score</option>
+                <option value="name">Name A-Z</option>
+                <option value="contacted">Recently contacted</option>
+              </select>
               <input class="search" id="from" type="date" title="From date">
               <input class="search" id="to" type="date" title="To date">
+              <span class="colmenu">
+                <button class="btn sm ghost" id="colBtn">Columns</button>
+                <span class="colmenu__pop" id="colPop" hidden>
+                  ${COLUMNS.map((c) => `<label class="colmenu__row"><input type="checkbox" data-col-toggle="${c[0]}"${c[2] ? ' checked' : ''}> ${esc(c[1])}</label>`).join('')}
+                </span>
+              </span>
             </div>
             <div class="bulk" id="bulk" hidden>
               <span id="bulkCount">0 selected</span>
               ${stages.map((x) => `<button class="btn sm ghost" data-bulk="${x}">Mark ${esc(STAGE_LABELS[x])}</button>`).join('')}
+              <button class="btn sm ghost" id="bulkAll">Mark all visible contacted</button>
               <button class="btn sm ghost" id="bulkClear">Clear</button>
             </div>
             ${(data.totalRows || rows.length) > rows.length ? `<p class="muted" style="margin:0 0 14px;font-size:.84rem">Showing the ${esc(rows.length)} most recent of ${esc(data.totalRows)}. <a href="/admin/dashboard?limit=200" style="color:var(--gold-dp)">Show 200</a> · <a href="/admin/dashboard?limit=500" style="color:var(--gold-dp)">Show all</a></p>` : ''}
-            ${rows.length ? `<div class="tablewrap"><table><thead><tr>
-              <th style="width:28px"></th><th class="hide">When</th><th>Applicant</th><th class="col-score">Score</th><th class="hide">Capital</th><th>Stage</th><th class="hide">Source</th><th class="col-open"></th>
+            ${rows.length ? `<div class="tablewrap" id="tablewrap"><table><thead><tr>
+              <th style="width:28px"></th><th class="hide" data-col="when">When</th><th>Applicant</th><th data-col="score">Score</th><th class="hide" data-col="capital">Capital</th><th data-col="stage">Stage</th><th class="hide" data-col="source">Source</th><th data-col="open"></th>
             </tr></thead><tbody id="tbody">${tableRows}</tbody></table></div>` : `<div class="empty"><b>No applications yet</b>When someone completes the form on the funnel it will land here.</div>`}
           </div>
           <aside class="leads__detail" id="detail">
@@ -435,7 +622,14 @@ export function dashboardPage(data, csrf) {
             <div class="panel__head">
               <div><h2>Activity</h2><p>Every change, newest first.</p></div>
             </div>
-            <ul class="mini">${activity}</ul>
+            <div class="chips" id="actChips">
+              <button class="chip on" data-act-filter="all">All</button>
+              <button class="chip" data-act-filter="lead">Leads</button>
+              <button class="chip" data-act-filter="admin">Admin</button>
+              <button class="chip" data-act-filter="system">System</button>
+            </div>
+            <ul class="mini actlist" id="actList">${activity}</ul>
+            <button class="btn sm ghost" id="actMore" style="margin-top:12px">Show more</button>
           </section>
         </div>
       </section>
@@ -520,12 +714,32 @@ export function dashboardPage(data, csrf) {
     <div class="palette__box">
       <input id="omniInput" type="search" placeholder="Jump to a lead by name, email or phone..." autocomplete="off">
       <ul class="palette__list" id="omniList"></ul>
+      <p class="palette__foot">↑ ↓ to move · Enter to open · Esc to close</p>
     </div>
   </div>
+
+  <div class="palette" id="shortcuts">
+    <div class="palette__box">
+      <div class="sheet__head"><b>Keyboard shortcuts</b><button class="drawer__x" id="sheetClose" aria-label="Close">×</button></div>
+      <dl class="keys">
+        <dt>⌘K / Ctrl K</dt><dd>Search and jump to a lead</dd>
+        <dt>/</dt><dd>Focus the search box</dd>
+        <dt>j / k</dt><dd>Move down / up the lead list</dd>
+        <dt>Enter</dt><dd>Open the selected lead</dd>
+        <dt>Esc</dt><dd>Close a panel or clear the search</dd>
+        <dt>?</dt><dd>This list</dd>
+      </dl>
+    </div>
+  </div>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </div>
     <script>
     const CSRF=${JSON.stringify(csrf)};
+    const VIEWS=${JSON.stringify(VIEWS)};
+    const TEMPLATES=${JSON.stringify(TEMPLATES)};
+    const COLS=${JSON.stringify(COLUMNS.map((c) => c[0]))};
+    const BASE_LEADS=${esc(total)};
     const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
     const toast=(m,ok,el)=>{
       const e=el||$('#toast');
@@ -539,8 +753,19 @@ export function dashboardPage(data, csrf) {
       const r=await fetch(url,{method:method||'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},body:body?JSON.stringify(body):undefined});
       return r.json().catch(()=>({ok:false,error:'bad response'}));
     }
+    function fmtAgo(ms){
+      if(!ms)return '';
+      const d=Date.now()-ms, m=Math.floor(d/60000);
+      if(m<1)return 'just now';
+      if(m<60)return m+'m ago';
+      const h=Math.floor(m/60);
+      if(h<24)return h+'h ago';
+      const dd=Math.floor(h/24);
+      if(dd<30)return dd+'d ago';
+      return new Date(ms).toISOString().slice(0,10);
+    }
+
     /* ---------------- section routing ---------------- */
-    const VIEWS=${JSON.stringify(VIEWS)};
     function setView(name){
       const v=VIEWS[name]?name:'overview';
       $$('.view').forEach(s=>s.classList.toggle('is-on',s.dataset.view===v));
@@ -563,8 +788,10 @@ export function dashboardPage(data, csrf) {
     if(burger)burger.addEventListener('click',()=>{const r=$('#rail');if(r)r.classList.toggle('is-open');});
 
     /* ---------------- lead detail ---------------- */
+    let selectedId='';
     function selectRow(id){
       $$('#tbody tr.row').forEach(tr=>tr.classList.toggle('is-sel',tr.dataset.id===id));
+      selectedId=id;
     }
     function openLead(id){
       const dr=document.querySelector('#d-'+id);
@@ -599,38 +826,119 @@ export function dashboardPage(data, csrf) {
       if(ev.target&&ev.target.closest('.pick'))return;
       toggleLead(tr.dataset.id);
     }));
+    $$('[data-print]').forEach(b=>b.addEventListener('click',()=>window.print()));
 
-    /* ---------------- command palette ---------------- */
-    const palette=$('#palette'), omniInput=$('#omniInput'), omniList=$('#omniList');
-    function paintOmni(q){
-      const ql=(q||'').trim().toLowerCase();
-      const rows=$$('#tbody tr.row');
-      const hits=rows.filter(tr=>!ql||(tr.dataset.search||'').includes(ql)).slice(0,8);
-      if(!omniList)return;
-      omniList.innerHTML=hits.length?hits.map(tr=>'<li data-goto="'+tr.dataset.id+'"><div><b>'+(tr.dataset.name||'Lead')+'</b><span>'+(tr.dataset.email||'')+'</span></div><span class="score '+(tr.dataset.band||'cool')+'">'+(tr.dataset.score||0)+'</span></li>').join(''):'<li class="muted" style="padding:12px 14px">No lead matches that.</li>';
-      omniList.querySelectorAll('[data-goto]').forEach(li=>li.addEventListener('click',()=>{
-        setView('leads');
-        openLead(li.dataset.goto);
-        closePalette();
-      }));
+    /* ---------------- filters + sorting ---------------- */
+    let stageF='all', srcF='', fromF='', toF='', tagF='';
+    function visibleRows(){
+      return $$('#tbody tr.row').filter(tr=>tr.style.display!=='none');
     }
-    function openPalette(){
-      if(!palette)return;
-      palette.classList.add('is-on');
-      if(omniInput){omniInput.value='';omniInput.focus();}
-      paintOmni('');
+    function applyFilter(){
+      const q=($('#q').value||'').toLowerCase();
+      $$('#tbody tr.row').forEach(tr=>{
+        const okStage=stageF==='all'||tr.dataset.stage===stageF||(stageF==='hot'&&tr.querySelector('.score.hot'))||(stageF==='dup'&&tr.dataset.dup==='1');
+        const okSrc=!srcF||tr.dataset.source===srcF;
+        const okTag=!tagF||(tr.dataset.tags||'').split(',').indexOf(tagF)>=0;
+        const okQ=!q||(tr.dataset.search||'').includes(q);
+        const rowDate=tr.dataset.date||'';
+        const okFrom=!fromF||(!!rowDate&&rowDate>=fromF);
+        const okTo=!toF||(!!rowDate&&rowDate<=toF);
+        tr.style.display=okStage&&okSrc&&okTag&&okQ&&okFrom&&okTo?'':'none';
+      });
     }
-    function closePalette(){
-      if(palette)palette.classList.remove('is-on');
+    let sortKey='new';
+    function applySort(){
+      const tbody=$('#tbody');
+      if(!tbody)return;
+      const rows=Array.from(tbody.querySelectorAll('tr.row'));
+      const n=(tr,k)=>Number(tr.dataset[k]||0);
+      rows.sort((a,b)=>{
+        if(sortKey==='oldest')return n(a,'created')-n(b,'created');
+        if(sortKey==='score')return n(b,'score')-n(a,'score');
+        if(sortKey==='scoreLow')return n(a,'score')-n(b,'score');
+        if(sortKey==='name')return (a.dataset.name||'').localeCompare(b.dataset.name||'');
+        if(sortKey==='contacted')return n(b,'contacted')-n(a,'contacted');
+        return n(b,'created')-n(a,'created');
+      });
+      rows.forEach(r=>tbody.appendChild(r));
     }
-    const omniBtn=$('#omniBtn');
-    if(omniBtn)omniBtn.addEventListener('click',openPalette);
-    if(palette)palette.addEventListener('click',e=>{if(e.target===palette)closePalette();});
-    if(omniInput)omniInput.addEventListener('input',e=>paintOmni(e.target.value));
-    document.addEventListener('keydown',e=>{
-      if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette();return;}
-      if(e.key==='Escape'){closePalette();closeLead();}
+    $$('#chips .chip').forEach(c=>c.addEventListener('click',()=>{
+      $$('#chips .chip').forEach(x=>x.classList.remove('on'));
+      c.classList.add('on');
+      stageF=c.dataset.filter;tagF='';
+      $$('#tagChips .chip').forEach(x=>x.classList.remove('on'));
+      applyFilter();
+    }));
+    $$('#tagChips .chip').forEach(c=>c.addEventListener('click',()=>{
+      const on=c.classList.contains('on');
+      $$('#tagChips .chip').forEach(x=>x.classList.remove('on'));
+      $$('#chips .chip').forEach(x=>x.classList.remove('on'));
+      stageF='all';
+      if(!on){c.classList.add('on');tagF=(c.dataset.filter||'').replace('tag:','').toLowerCase();}
+      applyFilter();
+    }));
+    $$('.pipe').forEach(p=>p.addEventListener('click',()=>{
+      $$('#chips .chip').forEach(x=>x.classList.remove('on'));
+      const chip=document.querySelector('#chips .chip[data-filter="'+p.dataset.stage+'"]');
+      if(chip) chip.classList.add('on');
+      stageF=p.dataset.stage;tagF='';
+      applyFilter();
+      setView('leads');
+    }));
+    $('#q').addEventListener('input',applyFilter);
+    $('#srcFilter').addEventListener('change',e=>{srcF=e.target.value;applyFilter();});
+    $('#from').addEventListener('change',e=>{fromF=e.target.value;applyFilter();});
+    $('#to').addEventListener('change',e=>{toF=e.target.value;applyFilter();});
+    $('#sortSel').addEventListener('change',e=>{sortKey=e.target.value;applySort();});
+
+    /* ---------------- column visibility ---------------- */
+    const tw=$('#tablewrap');
+    function applyCols(){
+      if(!tw)return;
+      COLS.forEach(c=>{
+        const on=$$('[data-col-toggle="'+c+'"]')[0];
+        tw.classList.toggle('col-off-'+c,!(on&&on.checked));
+      });
+    }
+    $$('[data-col-toggle]').forEach(c=>c.addEventListener('change',()=>{
+      applyCols();
+      try{
+        localStorage.setItem('s7f-cols',JSON.stringify(COLS.filter(c=>{const el=$$('[data-col-toggle="'+c+'"]')[0];return el&&el.checked;})));
+      }catch(e){}
+    }));
+    try{
+      const saved=JSON.parse(localStorage.getItem('s7f-cols')||'null');
+      if(saved&&saved.length){COLS.forEach(c=>{const el=$$('[data-col-toggle="'+c+'"]')[0];if(el)el.checked=saved.indexOf(c)>=0;});}
+    }catch(e){}
+    applyCols();
+    const colBtn=$('#colBtn'), colPop=$('#colPop');
+    if(colBtn&&colPop)colBtn.addEventListener('click',e=>{e.stopPropagation();colPop.hidden=!colPop.hidden;});
+    document.addEventListener('click',e=>{if(colPop&&!colPop.hidden&&!colPop.contains(e.target)&&e.target!==colBtn)colPop.hidden=true;});
+
+    /* ---------------- bulk ---------------- */
+    $$('.pick').forEach(c=>c.addEventListener('change',()=>{
+      const n=$$('.pick:checked').length; $('#bulk').hidden=n===0; $('#bulkCount').textContent=n+' selected';
+    }));
+    $$('[data-bulk]').forEach(b=>b.addEventListener('click',async()=>{
+      const ids=$$('.pick:checked').map(c=>Number(c.dataset.id));
+      if(!ids.length) return;
+      const r=await api('/admin/application/bulk',{ids,stage:b.dataset.bulk});
+      toast(r.ok?('Updated '+r.updated+' leads'):'Could not update',r.ok);
+      if(r.ok) setTimeout(()=>location.reload(),600);
+    }));
+    $('#bulkAll').addEventListener('click',async()=>{
+      const ids=visibleRows().map(tr=>Number(tr.dataset.id)).filter(Boolean);
+      if(!ids.length){toast('Nothing visible to update',false);return;}
+      if(!confirm('Mark all '+ids.length+' visible leads as Contacted?'))return;
+      let done=0;
+      for(let i=0;i<ids.length;i+=100){
+        const r=await api('/admin/application/bulk',{ids:ids.slice(i,i+100),stage:'contacted'});
+        if(r.ok)done+=r.updated||0;
+      }
+      toast('Updated '+done+' leads',true);
+      if(done)setTimeout(()=>location.reload(),700);
     });
+    $('#bulkClear').addEventListener('click',()=>{$$('.pick').forEach(c=>c.checked=false);$('#bulk').hidden=true;$('#bulkCount').textContent='0 selected';});
 
     /* ---------------- stage + notes + fields ---------------- */
     $$('[data-stage-set]').forEach(b=>b.addEventListener('click',async()=>{
@@ -649,7 +957,7 @@ export function dashboardPage(data, csrf) {
     }));
     $$('[data-save]').forEach(b=>b.addEventListener('click',async()=>{
       const id=b.dataset.save, body={notes:document.querySelector('#n-'+id).value};
-      $$('.edit[data-id="'+id+'"]').forEach(i=>{body[i.dataset.field]=i.value;});
+      $$('.edit[data-id="'+id+'"]').forEach(i=>{if(i.dataset.field!=='tags')body[i.dataset.field]=i.value;});
       const r=await api('/admin/application/'+id,body);
       toast(r.ok?'Saved':'Could not save',r.ok);
     }));
@@ -675,6 +983,94 @@ export function dashboardPage(data, csrf) {
         toast('Deleted',true);
       }else toast('Could not delete',false);
     }));
+
+    /* ---------------- tags ---------------- */
+    $$('[data-addtag]').forEach(b=>b.addEventListener('click',()=>{
+      const id=b.dataset.addtag, inp=document.querySelector('.edit[data-id="'+id+'"][data-field="tags"]');
+      if(!inp)return;
+      const cur=inp.value.split(',').map(x=>x.trim()).filter(Boolean);
+      const tag=b.dataset.tag;
+      if(cur.map(x=>x.toLowerCase()).indexOf(tag.toLowerCase())<0)cur.push(tag);
+      inp.value=cur.join(', ');
+    }));
+    $$('[data-tagsave]').forEach(b=>b.addEventListener('click',async()=>{
+      const id=b.dataset.tagsave;
+      const inp=document.querySelector('.edit[data-id="'+id+'"][data-field="tags"]');
+      if(!inp)return;
+      const r=await api('/admin/application/'+id,{tags:inp.value});
+      if(r.ok){
+        const row=document.querySelector('#tbody tr[data-id="'+id+'"]');
+        if(row){row.dataset.tags=inp.value.toLowerCase();}
+        toast('Tags saved',true);
+      }else toast('Could not save tags',false);
+    }));
+
+    /* ---------------- follow-up reminders ---------------- */
+    function setReminder(id,value,msg){
+      return api('/admin/application/'+id,{next_action_at:value}).then(r=>{
+        if(r.ok){
+          const out=document.querySelector('[data-rmmsg="'+id+'"]');
+          if(out)out.textContent=msg;
+          const row=document.querySelector('#tbody tr[data-id="'+id+'"]');
+          if(row)row.dataset.next=value;
+          toast('Follow-up saved',true);
+        }else toast('Could not save the follow-up',false);
+      });
+    }
+    $$('[data-remind]').forEach(b=>b.addEventListener('click',()=>{
+      const id=b.dataset.remind, days=Number(b.dataset.days||1);
+      const d=new Date(Date.now()+days*86400000);
+      const val=d.toISOString().slice(0,10)+' 09:00:00';
+      setReminder(id,val,'Follow-up set for '+d.toISOString().slice(0,10));
+    }));
+    $$('[data-rmdate]').forEach(inp=>inp.addEventListener('change',()=>{
+      const id=inp.dataset.rmdate;
+      if(!inp.value)return;
+      setReminder(id,inp.value+' 09:00:00','Follow-up set for '+inp.value);
+    }));
+    $$('[data-remindclear]').forEach(b=>b.addEventListener('click',()=>{
+      setReminder(b.dataset.remindclear,'','No follow-up set');
+    }));
+
+    /* ---------------- message templates ---------------- */
+    function tplText(id,key){
+      const row=document.querySelector('#tbody tr[data-id="'+id+'"]');
+      const name=(row&&row.dataset.name)||'';
+      const t=(TEMPLATES[key]||'').replace('{name}',name.split(' ')[0]||'there');
+      return t;
+    }
+    $$('[data-tpl]').forEach(sel=>sel.addEventListener('change',()=>{
+      const id=sel.dataset.tpl, key=sel.value;
+      const out=document.querySelector('[data-tplout="'+id+'"]');
+      if(!key){if(out){out.hidden=true;out.textContent='';}return;}
+      const txt=tplText(id,key);
+      if(out){out.hidden=false;out.textContent=txt;}
+      const row=document.querySelector('#tbody tr[data-id="'+id+'"]');
+      const wa=document.querySelector('[data-wa="'+id+'"]');
+      if(wa&&row)wa.href='https://wa.me/'+String(row.dataset.phone||'').replace(/\\D/g,'')+'?text='+encodeURIComponent(txt);
+    }));
+    $$('[data-tplcopy]').forEach(b=>b.addEventListener('click',async()=>{
+      const id=b.dataset.tplcopy;
+      const sel=document.querySelector('[data-tpl="'+id+'"]');
+      if(!sel||!sel.value){toast('Pick a template first',false);return;}
+      const txt=tplText(id,sel.value);
+      try{
+        if(!navigator.clipboard||!navigator.clipboard.writeText) throw new Error('no clipboard api');
+        await Promise.race([navigator.clipboard.writeText(txt),new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),1500))]);
+        toast('Message copied',true);
+      }catch(e){
+        try{
+          const ta=document.createElement('textarea');
+          ta.value=txt;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';
+          document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,ta.value.length);
+          const ok=document.execCommand('copy');
+          document.body.removeChild(ta);
+          toast(ok?'Message copied':'Could not copy',ok);
+        }catch(err){toast('Could not copy - the text is on screen',false);}
+      }
+    }));
+
+    /* ---------------- copy details ---------------- */
     $$('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{
       const id=b.dataset.copy;
       const row=document.querySelector('#tbody tr[data-id="'+id+'"]');
@@ -696,28 +1092,21 @@ export function dashboardPage(data, csrf) {
       toast('Copying...',true);
       try{
         if(!navigator.clipboard||!navigator.clipboard.writeText) throw new Error('no clipboard api');
-        await Promise.race([
-          navigator.clipboard.writeText(txt),
-          new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),1500))
-        ]);
+        await Promise.race([navigator.clipboard.writeText(txt),new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),1500))]);
         toast('Details copied',true);
       }catch(e){
         try{
           const ta=document.createElement('textarea');
-          ta.value=txt;
-          ta.setAttribute('readonly','');
-          ta.style.position='fixed';
-          ta.style.opacity='0';
-          document.body.appendChild(ta);
-          ta.select();
-          ta.setSelectionRange(0,ta.value.length);
+          ta.value=txt;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';
+          document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,ta.value.length);
           const ok=document.execCommand('copy');
           document.body.removeChild(ta);
           toast(ok?'Details copied':'Could not copy',ok);
         }catch(err){ toast('Could not copy - the details are on screen',false); }
       }
     }));
-    /* the logout form is a plain POST, so the CSRF token goes on as a header */
+
+    /* ---------------- logout + admins ---------------- */
     const logoutForm=document.getElementById('logoutForm');
     if(logoutForm){
       logoutForm.addEventListener('submit',async(ev)=>{
@@ -732,47 +1121,168 @@ export function dashboardPage(data, csrf) {
       if(r.ok){ const li=b.closest('li'); if(li) li.remove(); toast('Removed',true); }
       else toast(r.error||'Could not remove',false);
     }));
-    /* filters */
-    let stageF='all', srcF='', fromF='', toF='';
-    function applyFilter(){
-      const q=($('#q').value||'').toLowerCase();
-      $$('#tbody tr.row').forEach(tr=>{
-        const okStage=stageF==='all'||tr.dataset.stage===stageF||(stageF==='hot'&&tr.querySelector('.score.hot'));
-        const okSrc=!srcF||tr.dataset.source===srcF;
-        const okQ=!q||(tr.dataset.search||'').includes(q);
-        const rowDate=tr.dataset.date||'';
-        const okFrom=!fromF||(!!rowDate&&rowDate>=fromF);
-        const okTo=!toF||(!!rowDate&&rowDate<=toF);
-        tr.style.display=okStage&&okSrc&&okQ&&okFrom&&okTo?'':'none';
-      });
+
+    /* ---------------- command palette ---------------- */
+    const palette=$('#palette'), omniInput=$('#omniInput'), omniList=$('#omniList');
+    let omniHits=[], omniIdx=0;
+    function paintOmni(q){
+      const ql=(q||'').trim().toLowerCase();
+      const rows=$$('#tbody tr.row');
+      omniHits=rows.filter(tr=>!ql||(tr.dataset.search||'').includes(ql)).slice(0,8);
+      omniIdx=0;
+      if(!omniList)return;
+      omniList.innerHTML=omniHits.length?omniHits.map((tr,i)=>'<li data-goto="'+tr.dataset.id+'"'+(i===0?' class="is-on"':'')+'><div><b>'+(tr.dataset.name||'Lead')+'</b><span>'+(tr.dataset.email||'')+'</span></div><span class="score '+(tr.dataset.band||'cool')+'">'+(tr.dataset.score||0)+'</span></li>').join(''):'<li class="muted" style="padding:12px 14px">No lead matches that.</li>';
+      omniList.querySelectorAll('[data-goto]').forEach(li=>li.addEventListener('click',()=>{
+        setView('leads');
+        openLead(li.dataset.goto);
+        closePalette();
+      }));
     }
-    $$('#chips .chip').forEach(c=>c.addEventListener('click',()=>{$$('#chips .chip').forEach(x=>x.classList.remove('on'));c.classList.add('on');stageF=c.dataset.filter;applyFilter();}));
-    /* the pipeline bars are buttons too - they filter the same list */
-    $$('.pipe').forEach(p=>p.addEventListener('click',()=>{
-      $$('#chips .chip').forEach(x=>x.classList.remove('on'));
-      const chip=document.querySelector('#chips .chip[data-filter="'+p.dataset.stage+'"]');
-      if(chip) chip.classList.add('on');
-      stageF=p.dataset.stage;
-      applyFilter();
-      setView('leads');
+    function openPalette(){
+      if(!palette)return;
+      palette.classList.add('is-on');
+      if(omniInput){omniInput.value='';omniInput.focus();}
+      paintOmni('');
+    }
+    function closePalette(){
+      if(palette)palette.classList.remove('is-on');
+    }
+    const omniBtn=$('#omniBtn');
+    if(omniBtn)omniBtn.addEventListener('click',openPalette);
+    if(palette)palette.addEventListener('click',e=>{if(e.target===palette)closePalette();});
+    if(omniInput)omniInput.addEventListener('input',e=>paintOmni(e.target.value));
+
+    /* ---------------- keyboard shortcuts sheet ---------------- */
+    const sheet=$('#shortcuts');
+    function openSheet(){if(sheet)sheet.classList.add('is-on');}
+    function closeSheet(){if(sheet)sheet.classList.remove('is-on');}
+    const keysBtn=$('#keysBtn');
+    if(keysBtn)keysBtn.addEventListener('click',openSheet);
+    const sheetClose=$('#sheetClose');
+    if(sheetClose)sheetClose.addEventListener('click',closeSheet);
+    if(sheet)sheet.addEventListener('click',e=>{if(e.target===sheet)closeSheet();});
+
+    /* ---------------- keyboard navigation ---------------- */
+    function moveSelection(delta){
+      const vis=visibleRows();
+      if(!vis.length)return;
+      let i=vis.findIndex(tr=>tr.dataset.id===selectedId);
+      i=i<0?(delta>0?0:vis.length-1):Math.max(0,Math.min(vis.length-1,i+delta));
+      selectedId=vis[i].dataset.id;
+      vis.forEach(tr=>tr.classList.toggle('is-sel',tr.dataset.id===selectedId));
+      vis[i].scrollIntoView({block:'nearest'});
+    }
+    document.addEventListener('keydown',e=>{
+      const tag=(e.target&&e.target.tagName||'').toLowerCase();
+      const typing=tag==='input'||tag==='textarea'||tag==='select'||(e.target&&e.target.isContentEditable);
+      if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette();return;}
+      if(typing)return;
+      if(e.key==='Escape'){closePalette();closeSheet();closeLead();return;}
+      if(e.key==='?'){e.preventDefault();sheet&&sheet.classList.contains('is-on')?closeSheet():openSheet();return;}
+      if(e.key==='/'){e.preventDefault();setView('leads');const q=$('#q');if(q)q.focus();return;}
+      if(e.key==='j'||e.key==='J'){e.preventDefault();moveSelection(1);return;}
+      if(e.key==='k'||e.key==='K'){e.preventDefault();moveSelection(-1);return;}
+      if(e.key==='Enter'){
+        if(palette&&palette.classList.contains('is-on')){
+          e.preventDefault();
+          const hit=omniHits[omniIdx];
+          if(hit){setView('leads');openLead(hit.dataset.id);closePalette();}
+          return;
+        }
+        if(selectedId){e.preventDefault();openLead(selectedId);}
+        return;
+      }
+      if(palette&&palette.classList.contains('is-on')&&(e.key==='ArrowDown'||e.key==='ArrowUp')){
+        e.preventDefault();
+        if(!omniHits.length)return;
+        omniIdx=(omniIdx+(e.key==='ArrowDown'?1:-1)+omniHits.length)%omniHits.length;
+        omniList.querySelectorAll('[data-goto]').forEach((li,i)=>li.classList.toggle('is-on',i===omniIdx));
+        const on=omniList.querySelector('.is-on');
+        if(on)on.scrollIntoView({block:'nearest'});
+      }
+    });
+
+    /* ---------------- live: watch for new leads ---------------- */
+    let liveOn=false, liveTimer=null, liveBase=Number(BASE_LEADS)||0;
+    const liveBtn=$('#liveBtn'), newPill=$('#newPill');
+    async function pollLive(){
+      try{
+        const r=await fetch('/api/status',{headers:{'Accept':'application/json'}});
+        const j=await r.json();
+        if(j&&typeof j.leads==='number'){
+          if(j.leads>liveBase){
+            const d=j.leads-liveBase;
+            if(newPill){newPill.hidden=false;newPill.querySelector('b').textContent=d+' new lead'+(d===1?'':'s');}
+          }
+        }
+      }catch(e){}
+    }
+    if(liveBtn)liveBtn.addEventListener('click',()=>{
+      liveOn=!liveOn;
+      liveBtn.classList.toggle('is-on',liveOn);
+      liveBtn.setAttribute('aria-pressed',liveOn?'true':'false');
+      if(liveOn){liveTimer=setInterval(pollLive,45000);pollLive();}
+      else if(liveTimer){clearInterval(liveTimer);liveTimer=null;}
+    });
+    const newReload=$('#newReload');
+    if(newReload)newReload.addEventListener('click',()=>location.reload());
+
+    /* ---------------- relative times keep ticking ---------------- */
+    setInterval(()=>{
+      $$('[data-when-cell]').forEach(el=>{
+        const v=Number(el.dataset.whenCell||0);
+        if(!v)return;
+        const sla=el.querySelector('.sla');
+        el.textContent=fmtAgo(v);
+        if(sla)el.appendChild(sla);
+      });
+    },30000);
+
+    /* ---------------- activity log filter + more ---------------- */
+    let actLimit=10;
+    const actList=$('#actList');
+    function paintAct(){
+      if(!actList)return;
+      const items=Array.from(actList.querySelectorAll('li'));
+      let shown=0;
+      items.forEach(li=>{
+        const kind=li.dataset.act;
+        const kindOk=actKind==='all'||kind===actKind;
+        if(kindOk&&shown<actLimit){li.style.display='';shown++;}
+        else li.style.display='none';
+      });
+      const more=$('#actMore');
+      if(more)more.textContent=shown>=items.length?'Everything shown':'Show more';
+    }
+    let actKind='all';
+    $$('#actChips .chip').forEach(c=>c.addEventListener('click',()=>{
+      $$('#actChips .chip').forEach(x=>x.classList.remove('on'));
+      c.classList.add('on');
+      actKind=c.dataset.actFilter;
+      paintAct();
     }));
-    $('#q').addEventListener('input',applyFilter);
-    $('#srcFilter').addEventListener('change',e=>{srcF=e.target.value;applyFilter();});
-    $('#from').addEventListener('change',e=>{fromF=e.target.value;applyFilter();});
-    $('#to').addEventListener('change',e=>{toF=e.target.value;applyFilter();});
-    /* bulk */
-    $$('.pick').forEach(c=>c.addEventListener('change',()=>{
-      const n=$$('.pick:checked').length; $('#bulk').hidden=n===0; $('#bulkCount').textContent=n+' selected';
-    }));
-    $$('[data-bulk]').forEach(b=>b.addEventListener('click',async()=>{
-      const ids=$$('.pick:checked').map(c=>Number(c.dataset.id));
-      if(!ids.length) return;
-      const r=await api('/admin/application/bulk',{ids,stage:b.dataset.bulk});
-      toast(r.ok?('Updated '+r.updated+' leads'):'Could not update',r.ok);
-      if(r.ok) setTimeout(()=>location.reload(),600);
-    }));
-    $('#bulkClear').addEventListener('click',()=>{$$('.pick').forEach(c=>c.checked=false);$('#bulk').hidden=true;$('#bulkCount').textContent='0 selected';});
-    /* copy */
+    const actMore=$('#actMore');
+    if(actMore)actMore.addEventListener('click',()=>{
+      if(actLimit>=40){actLimit=10;}else{actLimit=actLimit+15;}
+      paintAct();
+    });
+    paintAct();
+
+    /* ---------------- dark mode ---------------- */
+    const themeBtn=$('#themeBtn');
+    function setTheme(dark){
+      const app=$('#app');
+      if(app)app.classList.toggle('is-dark',dark);
+      document.body.style.background=dark?'#14110D':'';
+      if(themeBtn)themeBtn.textContent=dark?'Light mode':'Dark mode';
+      try{localStorage.setItem('s7f-theme',dark?'dark':'light');}catch(e){}
+    }
+    let dark=false;
+    try{dark=localStorage.getItem('s7f-theme')==='dark';}catch(e){}
+    setTheme(dark);
+    if(themeBtn)themeBtn.addEventListener('click',()=>{dark=!dark;setTheme(dark);});
+
+    /* ---------------- site copy + settings + keys ---------------- */
     $('#saveContent').addEventListener('click',async()=>{
       const r=await api('/admin/content',{headline:$('#c-headline').value,subheadline:$('#c-subheadline').value,cta_label:$('#c-cta_label').value,specialties:$('#c-specialties').value,cost_answer:$('#c-cost_answer')?$('#c-cost_answer').value:''});
       toast(r.ok?'Copy saved - refresh the funnel to see it':'Could not save copy',r.ok,$('#contentMsg'));
