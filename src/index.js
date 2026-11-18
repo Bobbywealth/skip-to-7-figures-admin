@@ -623,10 +623,14 @@ async function handleApply(request, env, ctx) {
     .run();
 
   const leadId = res && res.meta && res.meta.last_row_id ? res.meta.last_row_id : null;
-  const lead = { id: leadId, name, email, phone, ...answers, score, duplicateOf };
+  const lead = { id: leadId, name, email, phone, ...answers, score, duplicateOf, event_id: clean(body.event_id, 64) };
 
   await logActivity(env, 'visitor', 'applied', leadId, `score ${score} (${scoreBand(score)})${flagged ? ' [no bot check]' : ''}`);
-  await recordEvent(env, 'apply_complete', '/', visitorId, { score });
+  await recordEvent(env, 'apply_complete', '/', visitorId, { score }, {
+    eventId: clean(body.event_id, 64),
+    fbp: clean(body.fbp, 80),
+    fbc: clean(body.fbc, 80)
+  });
   /* server-side conversion event for Meta - it shares the event id with the
      browser pixel event, so the lead is counted once instead of twice */
   const metaLead = sendMetaEvent(env, {
