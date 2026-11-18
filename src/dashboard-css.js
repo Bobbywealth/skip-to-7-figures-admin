@@ -161,18 +161,26 @@ export const DASH_CSS = `
 /* the lead table responds to the WIDTH OF THE LIST, not the window - with the
    detail panel open the list is much narrower than the viewport */
 @container leads (max-width:780px){
-  .app th.hide,.app td.hide{display:none}
+  .app .tablewrap [data-col="capital"],.app .tablewrap [data-col="source"],.app .tablewrap [data-col="open"]{display:none}
   .app table{min-width:0}
   .app td,.app th{padding-left:8px;padding-right:8px}
   .app .toolbar{gap:8px}
   .app .search{min-width:140px}
 }
 /* on a narrow list the score and the Open button are dropped - the whole row
-   is tappable, so the button is redundant and the name needs the room */
+   is tappable, so the button is redundant and the name needs the room. The
+   When column goes too, but the date and time move under the applicant name
+   so the time is never lost. */
 @container leads (max-width:540px){
-  .app .col-score,.app .col-open{display:none}
+  .app .tablewrap [data-col="score"],.app .tablewrap [data-col="open"],.app .tablewrap [data-col="when"],.app .tablewrap [data-col="stage"]{display:none}
+  .app .who__when{display:block}
+  .app .who__stage{display:inline-block}
   .app .who b{font-size:.95rem}
   .app .pill-cell{padding-left:0}
+}
+@container leads (min-width:541px){
+  .app .who__when{display:none}
+  .app .who__stage{display:none}
 }
 .app th{text-align:left;font:600 .64rem/1 var(--sans);letter-spacing:.15em;text-transform:uppercase;color:var(--muted);padding:0 12px 12px;border-bottom:1px solid var(--line)}
 .app td{padding:13px 12px;border-bottom:1px solid var(--line-2);vertical-align:middle}
@@ -186,6 +194,17 @@ export const DASH_CSS = `
 .app .who__av.warm{background:#F7EBD4;color:#8A6420;border-color:#EEDCB8}
 .app .who__av.cool{background:#EDEFEA;color:#6B6459;border-color:#E1E4DE}
 .app .who b{display:block;font-weight:600;line-height:1.25}
+/* the absolute date + time, shown under the applicant on a phone */
+/* the absolute date + time, shown under the applicant when the When column
+   is dropped. The hide/show pair is done with two container queries rather
+   than source order, so it cannot be broken by a rule being moved. */
+.app .who__when{margin-top:3px;font:600 .72rem/1.2 var(--mono);color:var(--muted)}
+.app .who__stage{margin-top:4px}
+/* the When column: absolute stamp on top, relative underneath */
+.app .when{white-space:nowrap}
+.app .when__d{display:block;font:600 .78rem/1.25 var(--sans);color:var(--ink)}
+.app .when__r{display:block;margin-top:2px;font:500 .72rem/1.2 var(--sans);color:var(--muted)}
+.app .when .sla{margin-left:0;margin-top:4px;display:inline-block}
 .app .who a{color:var(--muted);font-size:.8rem;text-decoration:none;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .app .who a:hover{text-decoration:underline}
 .app .pill{display:inline-block;border-radius:100px;padding:5px 12px;font:600 .72rem/1 var(--sans)}

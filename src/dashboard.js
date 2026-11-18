@@ -103,6 +103,20 @@ function slaOf(r) {
 function dateOnly(v) {
   return String(v || '').slice(0, 10);
 }
+/* the Worker runs in UTC, so the absolute stamp is rendered in Eastern Time
+   (the business is in New Jersey) rather than in the server's timezone */
+const ET = 'America/New_York';
+function absWhen(iso) {
+  const t = ms(iso);
+  if (!t) return '';
+  const d = new Date(t);
+  const stamp = new Intl.DateTimeFormat('en-US', {
+    timeZone: ET, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(d);
+  const thisYear = new Date().getFullYear();
+  const year = new Intl.DateTimeFormat('en-US', { timeZone: ET, year: 'numeric' }).format(d);
+  return Number(year) === thisYear ? stamp : stamp.replace(',', ', ' + year);
+}
 function plusDays(days) {
   const d = new Date(Date.now() + days * 86400000);
   return d.toISOString().slice(0, 10) + ' 09:00:00';
@@ -251,10 +265,15 @@ export function dashboardPage(data, csrf) {
         ` data-next="${esc(r.next_action_at || '')}" data-notes="${esc(r.notes || '')}"` +
         ` data-search="${esc([r.name, r.email, r.phone, r.capital, r.interest, r.utm_campaign, r.referrer, r.owner, src, r.notes, tags.join(' ')].join(' ').toLowerCase())}">` +
         `<td><input type="checkbox" class="pick" data-id="${esc(r.id)}" aria-label="Select lead ${esc(r.id)}"></td>` +
-        `<td class="mono hide" data-col="when" data-when-cell="${created}">${esc(when(r.created_at))}${slaChip}</td>` +
+        `<td class="mono hide" data-col="capital">${esc(r.capital)}</td>` +
+        `<td class="when" data-col="when" data-when-cell="${created}">` +
+        `<span class="when__d">${esc(absWhen(r.created_at))}</span>` +
+        `<span class="when__r" data-rel="${created}">${esc(when(r.created_at))}</span>${slaChip}</td>` +
         `<td class="who"><span class="who__av ${sc}">${esc(initials(r.name, r.email))}</span><div>` +
         `<b>${esc(r.name || '-')}${tagChips}${r.duplicate_of ? ' <span class="tag">dup</span>' : ''}${r.flagged ? ' <span class="tag tag--warn">unverified</span>' : ''}${r.spam ? ' <span class="tag tag--bad">spam</span>' : ''}</b>` +
-        `<a href="mailto:${esc(r.email)}">${esc(r.email)}</a></div></td>` +
+        `<a href="mailto:${esc(r.email)}">${esc(r.email)}</a>` +
+        `<span class="who__when">${esc(absWhen(r.created_at))}</span>` +
+        `<span class="who__stage"><span class="pill ${esc(st)}">${esc(STAGE_LABELS[st] || st)}</span></span></div></td>` +
         `<td data-col="score"><span class="score ${sc}">${esc(r.score || 0)}</span></td>` +
         `<td class="hide" data-col="capital">${esc(r.capital)}</td>` +
         `<td class="pill-cell" data-col="stage"><span class="pill ${esc(st)}">${esc(STAGE_LABELS[st] || st)}</span></td>` +
@@ -273,7 +292,7 @@ export function dashboardPage(data, csrf) {
       return `<div class="drawer" id="d-${esc(r.id)}">
       <div class="drawer__head">
         <div><h3>${esc(r.name || 'Applicant')} <span class="score ${band(r.score)}">${esc(r.score || 0)}</span>${sla === 2 ? '<span class="sla sla--2">24h+</span>' : sla === 1 ? '<span class="sla sla--1">3h+</span>' : ''}</h3>
-        <p class="muted" style="margin:4px 0 0;font-size:.82rem">${esc(when(r.created_at))} · ${esc(r.source_label || r.source || 'funnel')} · ${esc(r.device || '')} ${esc(r.country || '')}</p></div>
+        <p class="muted" style="margin:4px 0 0;font-size:.82rem">${esc(absWhen(r.created_at))} ET · ${esc(when(r.created_at))} · ${esc(r.source_label || r.source || 'funnel')} · ${esc(r.device || '')} ${esc(r.country || '')}</p></div>
         <div style="display:flex;align-items:center;gap:8px">
           <span class="pill ${esc(st)}">${esc(STAGE_LABELS[st] || st)}</span>
           <button class="drawer__x" data-close="${esc(r.id)}" aria-label="Close lead">×</button>
@@ -592,7 +611,7 @@ export function dashboardPage(data, csrf) {
             </div>
             ${(data.totalRows || rows.length) > rows.length ? `<p class="muted" style="margin:0 0 14px;font-size:.84rem">Showing the ${esc(rows.length)} most recent of ${esc(data.totalRows)}. <a href="/admin/dashboard?limit=200" style="color:var(--gold-dp)">Show 200</a> · <a href="/admin/dashboard?limit=500" style="color:var(--gold-dp)">Show all</a></p>` : ''}
             ${rows.length ? `<div class="tablewrap" id="tablewrap"><table><thead><tr>
-              <th style="width:28px"></th><th class="hide" data-col="when">When</th><th>Applicant</th><th data-col="score">Score</th><th class="hide" data-col="capital">Capital</th><th data-col="stage">Stage</th><th class="hide" data-col="source">Source</th><th data-col="open"></th>
+              <th style="width:28px"></th><th data-col="when">When (ET)</th><th>Applicant</th><th data-col="score">Score</th><th class="hide" data-col="capital">Capital</th><th data-col="stage">Stage</th><th class="hide" data-col="source">Source</th><th data-col="open"></th>
             </tr></thead><tbody id="tbody">${tableRows}</tbody></table></div>` : `<div class="empty"><b>No applications yet</b>When someone completes the form on the funnel it will land here.</div>`}
           </div>
           <aside class="leads__detail" id="detail">
@@ -1229,12 +1248,9 @@ export function dashboardPage(data, csrf) {
 
     /* ---------------- relative times keep ticking ---------------- */
     setInterval(()=>{
-      $$('[data-when-cell]').forEach(el=>{
-        const v=Number(el.dataset.whenCell||0);
-        if(!v)return;
-        const sla=el.querySelector('.sla');
-        el.textContent=fmtAgo(v);
-        if(sla)el.appendChild(sla);
+      $$('[data-rel]').forEach(el=>{
+        const v=Number(el.dataset.rel||0);
+        if(v)el.textContent=fmtAgo(v);
       });
     },30000);
 
