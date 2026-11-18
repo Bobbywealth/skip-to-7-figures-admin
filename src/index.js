@@ -344,12 +344,98 @@ async function hitRateLimit(env, key, max, windowMs) {
   }
 }
 
-async function recordEvent(env, name, path, visitorId, data) {
+async function recordEvent(env, name, path, visitorId, data, extra) {
   try {
-    await env.DB.prepare('INSERT INTO events(name,path,visitor_id,data) VALUES (?,?,?,?)')
-      .bind(String(name || '').slice(0, 40), String(path || '/').slice(0, 200), String(visitorId || '').slice(0, 64), JSON.stringify(data || {}).slice(0, 600))
+    const x = extra || {};
+    /* event_name is stored next to name: Meta's Conversions API calls the
+       field event_name and rejects an event that carries none */
+    await env.DB.prepare('INSERT INTO events(name,event_name,path,visitor_id,event_id,fbp,fbc,data) VALUES (?,?,?,?,?,?,?,?)')
+      .bind(
+        String(name || '').slice(0, 40),
+        String(name || '').slice(0, 40),
+        String(path || '/').slice(0, 200),
+        String(visitorId || '').slice(0, 64),
+        String(x.eventId || '').slice(0, 64),
+        String(x.fbp || '').slice(0, 80),
+        String(x.fbc || '').slice(0, 80),
+        JSON.stringify(data || {}).slice(0, 600)
+      )
       .run();
   } catch { /* ignore */ }
+}
+
+/* ---- Meta Conversions API (server-side conversion events) ----
+   Meta REQUIRES event_name on every server event and rejects an event that
+   carries none ("Missing event name"). The browser pixel and this server
+   event share an event id, so Meta counts the conversion once instead of
+   twice. It only runs when a pixel access token is configured
+   (META_CAPI_TOKEN); without one every call is a no-op. */
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(String(value || ''));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function metaUserData(u) {
+  const d = u || {};
+  const out = {};
+  try {
+    if (d.email) out.em = [await sha256Hex(String(d.email).trim().toLowerCase())];
+    if (d.phone) {
+      /* digits only, with a US leading 1 dropped - Meta hashes the national format */
+      const digits = String(d.phone).split('').filter((c) => c >= '0' && c <= '9').join('');
+      const national = digits.length === 11 && digits.charAt(0) === '1' ? digits.slice(1) : digits;
+      if (national) out.ph = [await sha256Hex(national)];
+    }
+    if (d.fbp) out.fbp = String(d.fbp).slice(0, 80);
+    if (d.fbc) out.fbc = String(d.fbc).slice(0, 80);
+    if (d.ip) out.client_ip_address = String(d.ip).slice(0, 60);
+    if (d.ua) out.client_user_agent = String(d.ua).slice(0, 300);
+  } catch { /* ignore */ }
+  return out;
+}
+
+/* Our event names -> Meta standard event names. Only conversions are sent
+   server-side: a page view stays browser-only, because Meta can only
+   de-duplicate a browser/server pair when both carry the same event id and
+   the page-view id never reaches the server. */
+function metaEventName(name) {
+  const n = String(name || '').toLowerCase();
+  if (n === 'lead' || n === 'apply_complete') return 'Lead';
+  if (n === 'schedule' || n === 'booking' || n === 'calendly') return 'Schedule';
+  return '';
+}
+
+async function sendMetaEvent(env, ev) {
+  const pixelId = clean((env && env.META_PIXEL_ID) || '1484110030240426', 40);
+  const token = env && env.META_CAPI_TOKEN;
+  if (!token) return { skipped: true, reason: 'no pixel access token configured' };
+  try {
+    const event = {
+      event_name: ev.eventName,
+      event_time: Math.floor(Number(ev.eventTime || Date.now() / 1000)),
+      action_source: 'website',
+      event_source_url: String(ev.url || '').slice(0, 300),
+      user_data: await metaUserData(ev.userData || {})
+    };
+    if (ev.eventId) event.event_id = String(ev.eventId).slice(0, 100);
+    if (ev.customData && Object.keys(ev.customData).length) event.custom_data = ev.customData;
+    const url = `https://graph.facebook.com/v21.0/${pixelId}/events?access_token=${encodeURIComponent(token)}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: [event] })
+    });
+    const body = await res.text();
+    if (!res.ok) {
+      await logError(env, 'Meta Conversions API: ' + body.slice(0, 300), '/api/meta');
+      return { ok: false, status: res.status, body: body.slice(0, 300) };
+    }
+    return { ok: true, status: res.status };
+  } catch (e) {
+    await logError(env, 'Meta Conversions API failed: ' + String(e && e.message ? e.message : e).slice(0, 200), '/api/meta');
+    return { ok: false, error: String(e) };
+  }
 }
 
 async function deliverWebhooks(env, event, payload) {
@@ -365,7 +451,13 @@ async function deliverWebhooks(env, event, payload) {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event, payload }),
+        body: JSON.stringify({
+          event,
+          event_name: event,
+          event_id: (payload && payload.event_id) || '',
+          event_time: Math.floor(Date.now() / 1000),
+          payload
+        }),
       });
       const body = (await res.text()).slice(0, 300);
       await env.DB.prepare('INSERT INTO webhook_out(url,event,status,response) VALUES (?,?,?,?)').bind(url, event, String(res.status), body).run();
@@ -498,8 +590,8 @@ async function handleApply(request, env, ctx) {
 
   const res = await env.DB.prepare(
     `INSERT INTO applications
-      (name,email,phone,capital,timeline,experience,interest,decision,source,page_url,referrer,user_agent,ip_hash,stage,score,owner,spam,flagged,duplicate_of,utm_source,utm_medium,utm_campaign,utm_content,utm_term,gclid,fbclid,device,country,visitor_id,delete_token)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,'',0,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      (name,email,phone,capital,timeline,experience,interest,decision,source,page_url,referrer,user_agent,ip_hash,stage,score,owner,spam,flagged,duplicate_of,utm_source,utm_medium,utm_campaign,utm_content,utm_term,gclid,fbclid,device,country,visitor_id,delete_token,event_id,fbp,fbc)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,'',0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   )
     .bind(
       name, email, phone, answers.capital, answers.timeline, answers.experience, answers.interest, answers.decision,
@@ -521,7 +613,12 @@ async function handleApply(request, env, ctx) {
       device,
       country,
       visitorId,
-      deleteToken
+      deleteToken,
+      /* the id the browser pixel used for this conversion, plus the Meta
+         click ids - the server event reuses them so Meta counts it once */
+      clean(body.event_id, 64),
+      clean(body.fbp, 80),
+      clean(body.fbc, 80)
     )
     .run();
 
@@ -530,6 +627,21 @@ async function handleApply(request, env, ctx) {
 
   await logActivity(env, 'visitor', 'applied', leadId, `score ${score} (${scoreBand(score)})${flagged ? ' [no bot check]' : ''}`);
   await recordEvent(env, 'apply_complete', '/', visitorId, { score });
+  /* server-side conversion event for Meta - it shares the event id with the
+     browser pixel event, so the lead is counted once instead of twice */
+  const metaLead = sendMetaEvent(env, {
+    eventName: 'Lead',
+    eventTime: Math.floor(Date.now() / 1000),
+    eventId: clean(body.event_id, 64),
+    url: clean(body.page_url, 300),
+    userData: { email, phone, ip: clientIp(request), ua, fbp: clean(body.fbp, 80), fbc: clean(body.fbc, 80) },
+    customData: Object.assign(
+      { content_name: 'Skip to 7 Figures application', lead_score: score },
+      leadId ? { lead_id: leadId } : {}
+    )
+  });
+  if (ctx && ctx.waitUntil) ctx.waitUntil(metaLead);
+  else await metaLead;
   /* EVERY lead pings Bobby - a flagged one is marked so he knows it skipped the
      bot check, but a real applicant is never silently hidden from him */
   await notifyLead(env, ctx, { ...lead, unverified: flagged });
@@ -550,13 +662,19 @@ async function handleContent(request, env) {
   return json(out);
 }
 
-async function handleTrack(request, env) {
+async function handleTrack(request, env, ctx) {
   let path = '';
   try { path = clean(new URL(request.url).searchParams.get('path'), 120); } catch { /* ignore */ }
   let body = {};
   try { body = await request.json(); } catch { /* ignore */ }
   if (!path) path = clean(body.path, 120) || '/';
-  const name = clean(body.name, 40) || 'view';
+  /* an event's name may arrive as 'name', 'event_name' or 'event' - Meta's
+     Conversions API calls it 'event_name' and rejects an event that carries
+     none, so every spelling is accepted and the canonical one is echoed back */
+  const name = clean(body.name || body.event_name || body.event || body.type, 40) || 'view';
+  const eventId = clean(body.event_id, 64);
+  const fbp = clean(body.fbp, 80);
+  const fbc = clean(body.fbc, 80);
   const day = new Date().toISOString().slice(0, 10);
   /* only real page views count as views - counting every event here would
      inflate the denominator and understate the conversion rate */
@@ -566,8 +684,23 @@ async function handleTrack(request, env) {
        ON CONFLICT(day,path) DO UPDATE SET count = count + 1`
     ).bind(day, path).run();
   }
-  await recordEvent(env, name, path, clean(body.visitor_id, 64), body.data || {});
-  return json({ ok: true });
+  await recordEvent(env, name, path, clean(body.visitor_id, 64), body.data || {}, { eventId, fbp, fbc });
+  /* a real booking is a conversion - the server event shares the id the
+     browser pixel used, so Meta counts it once */
+  const metaName = metaEventName(name);
+  if (metaName) {
+    const metaEvent = sendMetaEvent(env, {
+      eventName: metaName,
+      eventTime: Math.floor(Date.now() / 1000),
+      eventId,
+      url: clean(body.page_url, 300),
+      userData: { fbp, fbc, ip: clientIp(request), ua: request.headers.get('user-agent') || '' },
+      customData: {}
+    });
+    if (ctx && ctx.waitUntil) ctx.waitUntil(metaEvent);
+    else await metaEvent;
+  }
+  return json({ ok: true, name, event_name: name, event_id: eventId });
 }
 
 /* ---------------- auth ---------------- */
@@ -1072,7 +1205,7 @@ async function handleRequest(request, env, ctx) {
         const ipKey = await hashIp(clientIp(request), env.SESSION_SECRET);
         const allowed = await hitRateLimit(env, 'track:' + ipKey, 120, 60000);
         if (!allowed) return json({ ok: false, error: 'Too many events.' }, 429, cors);
-        const res = await handleTrack(request, env);
+        const res = await handleTrack(request, env, ctx);
         for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
         return res;
       }
@@ -1349,6 +1482,27 @@ await logActivity(env, session.sub, 'password_changed', null, '');
         const row = await env.DB.prepare('SELECT * FROM applications WHERE id = ?').bind(id).first();
         if (!row) return json({ ok: false, error: 'Not found.' }, 404);
         return json({ ok: true, lead: row });
+      }
+
+      /* ---- named events, for any external consumer ---- */
+      if ((path === '/v1/events' || path.startsWith('/v1/events/')) && method === 'GET') {
+        const key = await verifyApiKey(env, request);
+        if (!key) return json({ ok: false, error: 'Invalid or missing API key.' }, 401, cors);
+        const limit = Math.min(500, parseInt(new URL(request.url).searchParams.get('limit') || '100', 10) || 100);
+        const rows = await env.DB.prepare(
+          'SELECT id, name, event_name, path, visitor_id, event_id, data, created_at FROM events ORDER BY id DESC LIMIT ?'
+        ).bind(limit).all();
+        const events = (rows.results || []).map((r) => ({
+          id: r.id,
+          event_name: r.event_name || r.name || '',
+          name: r.name || '',
+          path: r.path,
+          visitor_id: r.visitor_id,
+          event_id: r.event_id,
+          data: r.data,
+          created_at: r.created_at
+        }));
+        return json({ ok: true, count: events.length, events });
       }
 
       /* ---- public GDPR self-delete (requires the per-application token) ---- */
