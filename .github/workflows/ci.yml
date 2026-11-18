@@ -50,7 +50,10 @@ jobs:
 
       - name: Check no secrets are committed
         run: |
-          if grep -rInE "[0-9]{8,10}:[A-Za-z0-9_-]{30,}|sk_live_|sk_test_|SESSION_SECRET\s*=\s*['\"][A-Za-z0-9_-]{16,}" \
+          # the Stripe key prefixes are written as character classes on
+          # purpose: spelling them out literally in this file would make the
+          # scan match its own pattern
+          if grep -rInE "[0-9]{8,10}:[A-Za-z0-9_-]{30,}|sk_liv[e_]|sk_tes[t_]|SESSION_SECRET\s*=\s*['\"][A-Za-z0-9_-]{16,}" \
             --exclude-dir=.git --exclude-dir=node_modules .; then
             echo "::error::a credential appears to be committed"
             exit 1
@@ -60,6 +63,9 @@ jobs:
       - name: The worker must bundle
         run: |
           set -e
-          npm ci --ignore-scripts --no-audit --no-fund
+          # NOT --ignore-scripts: the platform workerd binary is installed by
+          # that package's install script, and without it wrangler refuses to
+          # run with "you installed workerd on another platform"
+          npm ci --no-audit --no-fund
           npx wrangler deploy --dry-run --outdir .wrangler-dry-run
           echo "worker bundles cleanly"
