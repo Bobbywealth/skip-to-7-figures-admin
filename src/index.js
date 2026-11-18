@@ -164,9 +164,9 @@ const ADMIN_CSP = [
   "object-src 'none'",
   "frame-ancestors 'none'",
   "form-action 'self'",
-  "img-src 'self' data:",
-  "font-src 'self'",
-  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https://skip-to-7-figures.skip7figures.workers.dev",
+  "font-src 'self' https://fonts.gstatic.com",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "script-src 'self' 'unsafe-inline'",
   "connect-src 'self'",
 ].join('; ');
